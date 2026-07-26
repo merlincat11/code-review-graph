@@ -386,7 +386,9 @@ def query_graph(
                         seen_sources.add(e.source_qualified)
                         caller = store.get_node(e.source_qualified)
                         if caller:
-                            add_result(node_to_dict(caller), e)
+                            result = node_to_dict(caller)
+                            result["target_resolution"] = "unresolved"
+                            add_result(result, e)
 
         elif pattern == "callees_of":
             seen_targets: set[str] = set()
@@ -526,6 +528,7 @@ def query_graph(
                 if t.qualified_name not in seen and t.is_test:
                     result = node_to_dict(t)
                     result["indirect"] = False
+                    result["inferred_by"] = "naming_convention"
                     add_result(result)
                     seen.add(t.qualified_name)
 
