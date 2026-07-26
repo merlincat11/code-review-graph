@@ -278,6 +278,37 @@ class TestGraphStore:
         assert "/tests/check.py::verify_addition" in qns
         assert all(not r["indirect"] for r in results)
 
+    def test_get_transitive_tests_expands_file_descendants(self):
+        source_file = "/src/Calculator.php"
+        class_qn = f"{source_file}::Calculator"
+        method_qn = f"{class_qn}.add"
+        test_qn = "/tests/CalculatorTest.php::testItAddsTwoNumbers"
+        self.store.upsert_node(self._make_file_node(source_file))
+        self.store.upsert_node(self._make_class_node("Calculator", source_file))
+        self.store.upsert_node(self._make_func_node(
+            "add", source_file, parent="Calculator",
+        ))
+        self.store.upsert_node(self._make_func_node(
+            "testItAddsTwoNumbers", "/tests/CalculatorTest.php", is_test=True,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="CONTAINS", source=source_file, target=class_qn,
+            file_path=source_file,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="CONTAINS", source=class_qn, target=method_qn,
+            file_path=source_file,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="TESTED_BY", source=method_qn, target=test_qn,
+            file_path="/tests/CalculatorTest.php",
+        ))
+        self.store.commit()
+
+        results = self.store.get_transitive_tests(source_file)
+        assert [result["qualified_name"] for result in results] == [test_qn]
+        assert results[0]["indirect"] is False
+
     def test_get_transitive_tests_follows_calls_then_tested_by(self):
         """Transitive coverage: caller -> CALLS -> callee -> TESTED_BY -> test.
         Uses an unconventional test name so the bare-name fallback cannot
@@ -807,6 +838,39 @@ class TestResolveBareEndpoints:
 
         assert self.store.resolve_bare_tested_by_sources() == 1
         assert self._endpoints("TESTED_BY") == [(source_qn, test_qn)]
+
+    def test_php_class_import_resolves_bare_tested_by_source(self):
+        source_file = "/repo/src/Calculator.php"
+        source_qn = f"{source_file}::Calculator.add"
+        self.store.upsert_node(NodeInfo(
+            kind="Class",
+            name="Calculator",
+            file_path=source_file,
+            line_start=1,
+            line_end=5,
+            language="php",
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Function",
+            name="add",
+            file_path=source_file,
+            line_start=1,
+            line_end=5,
+            language="php",
+            parent_name="Calculator",
+        ))
+        test_file = "/repo/tests/CalculatorTest.php"
+        test_qn = self._func("testItAddsTwoNumbers", test_file, is_test=True)
+        self._edge("IMPORTS_FROM", test_file, r"App\Calculator", test_file)
+        self._edge("TESTED_BY", "add", test_qn, test_file)
+        self.store.commit()
+
+        assert self.store.resolve_bare_tested_by_sources() == 1
+        assert self._endpoints("TESTED_BY") == [(source_qn, test_qn)]
+        assert [
+            result["qualified_name"]
+            for result in self.store.get_transitive_tests(source_qn, max_depth=0)
+        ] == [test_qn]
 
     def test_ambiguous_tested_by_source_uses_one_imported_candidate(self):
         source_qn = self._func("parse", "/repo/src/app.py")

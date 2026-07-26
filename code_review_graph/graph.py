@@ -451,19 +451,33 @@ class GraphStore:
         seen: set[str] = set()
         results: list[dict] = []
 
-        # If the input is a class, expand to its methods first.
+        # If the input is a class or file, expand all nested members first.
         input_qns = [qualified_name]
         row = conn.execute(
             "SELECT kind FROM nodes WHERE qualified_name = ?",
             (qualified_name,),
         ).fetchone()
-        if row and row["kind"] == "Class":
-            for mrow in conn.execute(
-                "SELECT target_qualified FROM edges "
-                "WHERE source_qualified = ? AND kind = 'CONTAINS'",
-                (qualified_name,),
-            ).fetchall():
-                input_qns.append(mrow["target_qualified"])
+        if row and row["kind"] in ("Class", "File"):
+            seen_contained = {qualified_name}
+            contained_frontier = [qualified_name]
+            while contained_frontier:
+                next_contained: list[str] = []
+                for container in contained_frontier:
+                    for mrow in conn.execute(
+                        "SELECT e.target_qualified, n.kind FROM edges e "
+                        "LEFT JOIN nodes n ON n.qualified_name = e.target_qualified "
+                        "WHERE e.source_qualified = ? AND e.kind = 'CONTAINS' "
+                        "ORDER BY e.id",
+                        (container,),
+                    ).fetchall():
+                        target = mrow["target_qualified"]
+                        if target in seen_contained:
+                            continue
+                        seen_contained.add(target)
+                        input_qns.append(target)
+                        if mrow["kind"] in ("Class", "File"):
+                            next_contained.append(target)
+                contained_frontier = next_contained
 
         def _node_dict(qn: str, indirect: bool) -> dict | None:
             row = conn.execute(
@@ -876,6 +890,16 @@ class GraphStore:
             )
 
         # call-site file -> explicitly imported files
+        # PHP IMPORTS_FROM targets currently retain class names (for example,
+        # ``App\\Calculator``) rather than file paths. Resolve those names to
+        # defining class files so they can provide the same import evidence.
+        php_class_files: dict[str, set[str]] = {}
+        for row in conn.execute(
+            "SELECT name, file_path FROM nodes "
+            "WHERE kind = 'Class' AND language = 'php'"
+        ).fetchall():
+            php_class_files.setdefault(row["name"], set()).add(row["file_path"])
+
         import_targets: dict[str, set[str]] = {}
         for row in conn.execute(
             "SELECT DISTINCT file_path, target_qualified FROM edges "
@@ -883,7 +907,10 @@ class GraphStore:
         ).fetchall():
             target = row["target_qualified"]
             target_file = target.split("::", 1)[0] if "::" in target else target
-            import_targets.setdefault(row["file_path"], set()).add(target_file)
+            files = import_targets.setdefault(row["file_path"], set())
+            files.add(target_file)
+            if "\\" in target:
+                files.update(php_class_files.get(target.rsplit("\\", 1)[-1], ()))
 
         resolved = 0
         for edge in bare_edges:
