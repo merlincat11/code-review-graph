@@ -1285,12 +1285,7 @@ def watch(
                 return
             if _should_ignore(rel, ignore_patterns):
                 return
-            try:
-                store.remove_file_data(event.src_path)
-                store.commit()
-                logger.info("Removed: %s", rel)
-            except Exception as e:
-                logger.error("Error removing %s: %s", rel, e)
+            self._schedule(event.src_path)
 
         def _schedule(self, abs_path: str):
             """Add file to pending set and reset the debounce timer."""
@@ -1308,12 +1303,19 @@ def watch(
                 self._pending.clear()
                 self._timer = None
 
-            updated = 0
+            updated_paths = []
             for abs_path in paths:
                 if self._update_file(abs_path):
-                    updated += 1
+                    updated_paths.append(abs_path)
 
-            if updated > 0 and on_files_updated is not None:
+            if updated_paths:
+                self._post_update(updated_paths)
+
+        def _post_update(self, paths: list[str]) -> None:
+            """Resolve language references before refreshing derived data."""
+            if any(Path(path).suffix == ".py" for path in paths):
+                _run_python_resolver(store)
+            if on_files_updated is not None:
                 try:
                     on_files_updated(store)
                 except Exception as e:
@@ -1322,7 +1324,14 @@ def watch(
         def _update_file(self, abs_path: str) -> bool:
             path = Path(abs_path)
             if not path.is_file():
-                return False
+                try:
+                    store.remove_file_data(abs_path)
+                    store.commit()
+                    logger.info("Removed: %s", path.relative_to(repo_root))
+                    return True
+                except Exception as e:
+                    logger.error("Error removing %s: %s", abs_path, e)
+                    return False
             if path.is_symlink():
                 return False
             if _is_binary(path):
