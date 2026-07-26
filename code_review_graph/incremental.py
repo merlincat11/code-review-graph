@@ -76,6 +76,16 @@ CPP_IDENTITY_VERSION = "1"
 _CPP_IDENTITY_METADATA_KEY = "cpp_identity_version"
 
 
+def _run_python_resolver(store: GraphStore) -> Optional[dict]:
+    """Run repository-wide Python import resolution without failing a build."""
+    try:
+        from .python_resolver import resolve_python_imports
+        return resolve_python_imports(store)
+    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+        logger.warning("Python import resolver failed: %s", exc)
+        return None
+
+
 def _run_rescript_resolver(store: GraphStore) -> Optional[dict]:
     """Run the ReScript cross-module resolver, swallowing any failure so
     build never fails because of it. Returns stats or None on error.
@@ -1004,6 +1014,7 @@ def full_build(
     _store_vcs_metadata(repo_root, store)
     store.commit()
 
+    python_stats = _run_python_resolver(store)
     rescript_stats = _run_rescript_resolver(store)
     spring_stats = _run_spring_resolver(store)
     spring_event_stats = _run_spring_event_resolver(store)
@@ -1015,6 +1026,7 @@ def full_build(
         "total_nodes": total_nodes,
         "total_edges": total_edges,
         "errors": errors,
+        "python_resolution": python_stats,
         "rescript_resolution": rescript_stats,
         "spring_resolution": spring_stats,
         "event_resolution": spring_event_stats,
@@ -1049,6 +1061,7 @@ def incremental_update(
             "dependent_files": [],
             "errors": rebuilt["errors"],
             "identity_rebuild": True,
+            "python_resolution": rebuilt["python_resolution"],
             "rescript_resolution": rebuilt["rescript_resolution"],
             "spring_resolution": rebuilt["spring_resolution"],
             "event_resolution": rebuilt["event_resolution"],
@@ -1163,6 +1176,9 @@ def incremental_update(
     store.commit()
 
     # Only re-run language-specific resolvers when the relevant files changed.
+    python_changed = any(rp.endswith(".py") for rp in all_files)
+    python_stats = _run_python_resolver(store) if python_changed else None
+
     rescript_changed = any(
         rp.endswith((".res", ".resi")) for rp in all_files
     )
@@ -1186,6 +1202,7 @@ def incremental_update(
         "changed_files": list(changed_files),
         "dependent_files": list(dependent_files),
         "errors": errors,
+        "python_resolution": python_stats,
         "rescript_resolution": rescript_stats,
         "spring_resolution": spring_stats,
         "event_resolution": spring_event_stats,
