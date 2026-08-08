@@ -2712,25 +2712,6 @@ class CodeParser:
         # File node
         test_file = _is_test_file(file_path_str)
         file_extra: dict = {}
-        if language == "go":
-            package_clause = next(
-                (
-                    child for child in tree.root_node.children
-                    if child.type == "package_clause"
-                ),
-                None,
-            )
-            if package_clause is not None:
-                package_name = next(
-                    (
-                        child.text.decode("utf-8", errors="replace")
-                        for child in package_clause.children
-                        if child.type == "package_identifier"
-                    ),
-                    None,
-                )
-                if package_name:
-                    file_extra["go_package"] = package_name
         # C#: record the namespace(s) this file declares so query-time
         # fallbacks can resolve namespace-form IMPORTS_FROM targets (from
         # `using X.Y;` directives) back to the declaring file. See: #310

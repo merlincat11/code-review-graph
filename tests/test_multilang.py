@@ -142,6 +142,12 @@ type (
             "type Alias = Vertex\n",
             encoding="utf-8",
         )
+        external_test_file = tmp_path / "base" / "shadow_test.go"
+        external_test_file.write_text(
+            "package graph_test\n"
+            "type Vertex interface { Fake() }\n",
+            encoding="utf-8",
+        )
         strange_file = tmp_path / "strange-path" / "types.go"
         strange_file.write_text(
             "package odd\n"
@@ -168,7 +174,9 @@ type (
         store = GraphStore(tmp_path / ".code-review-graph" / "graph.db")
         try:
             parser = CodeParser(tmp_path)
-            for path in (base_file, strange_file, consumer_file):
+            for path in (
+                base_file, external_test_file, strange_file, consumer_file,
+            ):
                 nodes, edges = parser.parse_file(path)
                 store.store_file_nodes_edges(str(path), nodes, edges)
 
@@ -196,6 +204,10 @@ type (
             assert (
                 "INHERITS", "InterfaceEmbedding", f"{base_file}::Vertex",
             ) in relations
+            assert not any(
+                target == f"{external_test_file}::Vertex"
+                for _, _, target in relations
+            )
             assert (
                 "INHERITS", "AliasEmbedding", f"{base_file}::Alias",
             ) in relations

@@ -795,14 +795,19 @@ class GraphStore:
             ).append(candidate)
             candidate_dirs.add(directory)
 
+        source_files = tuple({edge["file_path"] for edge in edges})
         imports_by_file: dict[str, list[str]] = {}
-        for row in self._conn.execute(
-            "SELECT file_path, target_qualified FROM edges "
-            "WHERE kind = 'IMPORTS_FROM'",
-        ).fetchall():
-            imports_by_file.setdefault(row["file_path"], []).append(
-                row["target_qualified"],
-            )
+        for start in range(0, len(source_files), 500):
+            batch = source_files[start:start + 500]
+            placeholders = ",".join("?" for _ in batch)
+            for row in self._conn.execute(
+                "SELECT file_path, target_qualified FROM edges "
+                f"WHERE kind = 'IMPORTS_FROM' AND file_path IN ({placeholders})",
+                batch,
+            ):
+                imports_by_file.setdefault(row["file_path"], []).append(
+                    row["target_qualified"],
+                )
 
         import_dir_cache: dict[tuple[str, str], str | None] = {}
 
@@ -887,6 +892,11 @@ class GraphStore:
                 for candidate in by_directory_name.get(
                     (imported_directory, name), [],
                 ):
+                    # Normal imports never expose declarations from _test.go;
+                    # including external-test packages here creates a false
+                    # ambiguity with production types of the same name.
+                    if candidate["file_path"].endswith("_test.go"):
+                        continue
                     if import_path is None and candidate["package"] != qualifier:
                         continue
                     matches[candidate["qualified_name"]] = candidate
@@ -929,7 +939,7 @@ class GraphStore:
                 return None
             return interface_status(target, seen | {qualified})
 
-        changed = 0
+        updates: list[tuple[str, str, int]] = []
         for edge in edges:
             extra = load_extra(edge["extra"])
             raw_target = extra.get("go_embedding_target")
@@ -961,16 +971,18 @@ class GraphStore:
                 and edge["target_qualified"] == desired_target
             ):
                 continue
-            self._conn.execute(
-                "UPDATE edges SET kind = ?, target_qualified = ? WHERE id = ?",
+            updates.append(
                 (desired_kind, desired_target, edge["id"]),
             )
-            changed += 1
 
-        if changed:
+        if updates:
+            self._conn.executemany(
+                "UPDATE edges SET kind = ?, target_qualified = ? WHERE id = ?",
+                updates,
+            )
             self._conn.commit()
             self._invalidate_cache()
-        return changed
+        return len(updates)
 
     def resolve_cpp_scoped_call_targets(self) -> int:
         """Resolve cross-file C++ ``Scope::call`` targets by stable scope identity.
