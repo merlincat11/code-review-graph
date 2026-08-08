@@ -15136,15 +15136,55 @@ class CodeParser:
                                     bases.append(ident.text.decode("utf-8", errors="replace"))
         elif language == "go":
             # Embedded structs / interface composition
-            for child in node.children:
-                if child.type == "type_spec":
-                    for sub in child.children:
-                        if sub.type in ("struct_type", "interface_type"):
-                            for field_node in sub.children:
-                                if field_node.type == "field_declaration_list":
-                                    for f in field_node.children:
-                                        if f.type == "type_identifier":
-                                            bases.append(f.text.decode("utf-8", errors="replace"))
+            type_spec = next(
+                (child for child in node.children if child.type == "type_spec"),
+                None,
+            )
+            if type_spec is None:
+                return bases
+            type_body = next(
+                (
+                    child for child in type_spec.children
+                    if child.type in ("struct_type", "interface_type")
+                ),
+                None,
+            )
+            if type_body is None:
+                return bases
+
+            embedded_types = []
+            if type_body.type == "struct_type":
+                for child in type_body.children:
+                    if child.type != "field_declaration_list":
+                        continue
+                    for field in child.named_children:
+                        if (
+                            field.type == "field_declaration"
+                            and field.child_by_field_name("name") is None
+                        ):
+                            embedded_types.append(
+                                field.child_by_field_name("type"),
+                            )
+            else:
+                for element in type_body.named_children:
+                    if (
+                        element.type == "type_elem"
+                        and len(element.named_children) == 1
+                        and element.named_children[0].type in (
+                            "type_identifier", "qualified_type", "generic_type",
+                        )
+                    ):
+                        embedded_types.append(element.named_children[0])
+
+            for embedded in embedded_types:
+                if embedded is None:
+                    continue
+                if embedded.type == "generic_type":
+                    embedded = embedded.child_by_field_name("type")
+                if embedded is not None:
+                    bases.append(
+                        embedded.text.decode("utf-8", errors="replace"),
+                    )
         elif language == "dart":
             # class Foo extends Bar with Mixin implements Iface { ... }
             # AST: superclass contains type_identifier (base) and mixins (with clause);

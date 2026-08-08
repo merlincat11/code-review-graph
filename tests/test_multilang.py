@@ -44,6 +44,50 @@ class TestGoParsing:
         contains = [e for e in self.edges if e.kind == "CONTAINS"]
         assert len(contains) >= 3
 
+    def test_finds_embedded_types(self):
+        source = b"""
+package sample
+
+import pkg "example.com/pkg"
+
+type Local struct{}
+type Generic[T any] struct{}
+type LocalInterface interface { Method() }
+type GenericInterface[T any] interface { Method(T) }
+
+type EmbeddedStruct struct {
+    Local
+    *pkg.Remote
+    Generic[int]
+    pkg.Generic[string]
+    Named Local
+}
+
+type EmbeddedInterface interface {
+    LocalInterface
+    pkg.RemoteInterface
+    GenericInterface[int]
+    ~int | string
+    OwnMethod()
+}
+"""
+        _, edges = self.parser.parse_bytes(Path("sample.go"), source)
+
+        inherits = {
+            (edge.source.rsplit("::", 1)[-1], edge.target)
+            for edge in edges
+            if edge.kind == "INHERITS"
+        }
+        assert inherits == {
+            ("EmbeddedStruct", "Local"),
+            ("EmbeddedStruct", "pkg.Remote"),
+            ("EmbeddedStruct", "Generic"),
+            ("EmbeddedStruct", "pkg.Generic"),
+            ("EmbeddedInterface", "LocalInterface"),
+            ("EmbeddedInterface", "pkg.RemoteInterface"),
+            ("EmbeddedInterface", "GenericInterface"),
+        }
+
     def test_methods_attached_to_receiver(self):
         """Go methods should be attached to their receiver type (#190).
 
