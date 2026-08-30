@@ -1170,6 +1170,21 @@ class TestCSharpReceiverCallResolution:
         "    public void Call() { handler.Store(); }\n"
         "}\n"
     )
+    GLOBAL_USING = "global using Depot;\n"
+    GLOBAL_USING_TARGET = (
+        "namespace Depot;\n"
+        "public class Crate\n"
+        "{\n"
+        "    public class PackHandler { public void Pack() { } }\n"
+        "}\n"
+    )
+    GLOBAL_USING_CONSUMER = (
+        "public class GlobalUsingConsumer\n"
+        "{\n"
+        "    Crate.PackHandler handler;\n"
+        "    public void Call() { handler.Pack(); }\n"
+        "}\n"
+    )
     MULTI_NAMESPACE = (
         "namespace App\n"
         "{\n"
@@ -1296,6 +1311,9 @@ class TestCSharpReceiverCallResolution:
             "MultiNamespace.cs": self.MULTI_NAMESPACE,
             "WrongNamespaceExactPath.cs": self.WRONG_NAMESPACE_EXACT_PATH,
             "WrongNamespaceExactConsumer.cs": self.WRONG_NAMESPACE_EXACT_CONSUMER,
+            "GlobalUsings.cs": self.GLOBAL_USING,
+            "GlobalUsingTarget.cs": self.GLOBAL_USING_TARGET,
+            "GlobalUsingConsumer.cs": self.GLOBAL_USING_CONSUMER,
             "MultiNamespaceConsumer.cs": self.MULTI_NAMESPACE_CONSUMER,
             "WrongNamespaceConsumer.cs": self.WRONG_NAMESPACE_CONSUMER,
             "LoneBareConsumer.cs": self.LONE_BARE_CONSUMER,
@@ -1418,20 +1436,38 @@ class TestCSharpReceiverCallResolution:
         targets = self._call_targets_of(tmp_path, "MultiNamespaceConsumer.Call")
         assert targets == {"Post"}, targets
 
-    def test_exact_path_match_still_checks_the_candidate_namespace(
+    @pytest.mark.xfail(
+        reason=(
+            "Known limitation: namespaces are absent from parent_name, so an "
+            "exact containing-type match cannot prove the candidate is the type "
+            "the receiver names. Deciding this needs per-node namespaces; "
+            "file-level evidence cannot. main mislinks this too, on the bare "
+            "name, so the branch narrows rather than introduces it."
+        ),
+    )
+    def test_exact_path_match_should_check_the_candidate_namespace(
         self, tmp_path,
     ):
-        """An exact containing-type match is not an exact *type* match, because
-        namespaces are absent from ``parent_name``. ``Vault.Archive.StoreHandler``
-        declared inside ``namespace Other`` is keyed exactly as the receiver
-        spells it, yet the caller means a different type entirely and cannot see
-        ``Other``. Matching the path alone would fabricate the edge.
-        """
+        """``Vault.Archive.StoreHandler`` declared inside ``namespace Other`` is
+        keyed exactly as the receiver spells it, but the caller means a
+        different type and cannot see ``Other``."""
         self._build(tmp_path)
         targets = self._call_targets_of(
             tmp_path, "ExactPathNamespaceConsumer.Call",
         )
         assert targets == {"Store"}, targets
+
+    def test_global_using_target_still_resolves(self, tmp_path):
+        """A ``global using`` applies project-wide, from a different file than
+        the call site. Any future namespace-visibility check must not treat the
+        caller's own file as the only source of visibility evidence, or valid
+        calls like this one regress to unresolved.
+        """
+        self._build(tmp_path)
+        target = tmp_path / "GlobalUsingTarget.cs"
+        assert self._call_targets_of(tmp_path, "GlobalUsingConsumer.Call") == {
+            f"{target.as_posix()}::Crate.PackHandler.Pack"
+        }
 
     def test_bare_receiver_never_selects_a_nested_type(self, tmp_path):
         """A bare ``QueryHandler`` cannot name ``Details.QueryHandler`` in C#;

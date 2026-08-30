@@ -351,32 +351,6 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
                     ns for ns in declared if isinstance(ns, str)
                 }
 
-    def _csharp_namespace_visible(candidate: str, caller_file: str) -> bool:
-        """Whether *caller_file* can name *candidate* without qualifying it.
-
-        Namespaces are absent from ``parent_name``, so an exact containing-type
-        match proves nothing about the namespace the candidate actually sits in:
-        a type declared ``namespace Other { class App { class Report { ... } } }``
-        is keyed as ``App.Report.ExportHandler`` and matches a receiver meaning a
-        wholly different ``App.Report.ExportHandler``. When the receiver names no
-        namespace itself, the candidate's namespace therefore has to be reachable
-        from the call site -- same file, the global namespace, a ``using``, or a
-        namespace the caller declares.
-        """
-        candidate_file = file_of.get(candidate, "")
-        if candidate_file == caller_file:
-            return True
-        declared = csharp_namespaces_by_file.get(candidate_file, set())
-        if not declared:
-            return True  # global namespace is visible everywhere
-        visible = {
-            target
-            for target in imports_by_file.get(caller_file, set())
-            if "/" not in target and "\\" not in target
-        }
-        visible |= csharp_namespaces_by_file.get(caller_file, set())
-        return bool(declared & visible)
-
     def csharp_disambiguate(
         candidates: list[str], caller_file: str
     ) -> tuple[Optional[str], Optional[str]]:
@@ -545,16 +519,6 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
             ))
             if not found:
                 continue
-            if dropped_namespace is None and language == "csharp":
-                # The receiver named no namespace, so the candidate's own
-                # namespace must be reachable from the call site.
-                found = [
-                    candidate
-                    for candidate in found
-                    if _csharp_namespace_visible(candidate, row["file_path"])
-                ]
-                if not found:
-                    continue
             if dropped_namespace is not None:
                 # The namespace evidence is per *file*, not per node, and one C#
                 # file may declare several namespaces. Membership alone would
