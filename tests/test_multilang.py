@@ -628,6 +628,134 @@ class TestCSharpParsing:
         assert "Status" not in by_source
         assert "byte" not in {edge.target for edge in inherits}
 
+    def test_nested_types_keep_complete_identity_and_containment(self, tmp_path):
+        path = tmp_path / "Nested.cs"
+        path.write_text(
+            "public class Details {\n"
+            "    public class QueryHandler { public void Handle() {} }\n"
+            "}\n"
+            "public class Edit {\n"
+            "    public class QueryHandler { public void Handle() {} }\n"
+            "}\n"
+            "public class A {\n"
+            "    public class B {\n"
+            "        public class C { public void M() {} }\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+
+        nodes, edges = self.parser.parse_file(path)
+        prefix = path.as_posix()
+        qualified = {
+            self.parser._node_qualified(node)
+            for node in nodes
+            if node.kind != "File"
+        }
+        assert {
+            f"{prefix}::Details.QueryHandler.Handle",
+            f"{prefix}::Edit.QueryHandler.Handle",
+            f"{prefix}::A.B.C",
+            f"{prefix}::A.B.C.M",
+        } <= qualified
+
+        contains = {
+            (edge.source, edge.target)
+            for edge in edges
+            if edge.kind == "CONTAINS"
+        }
+        assert {
+            (f"{prefix}::Details", f"{prefix}::Details.QueryHandler"),
+            (
+                f"{prefix}::Details.QueryHandler",
+                f"{prefix}::Details.QueryHandler.Handle",
+            ),
+            (f"{prefix}::Edit", f"{prefix}::Edit.QueryHandler"),
+            (
+                f"{prefix}::Edit.QueryHandler",
+                f"{prefix}::Edit.QueryHandler.Handle",
+            ),
+            (f"{prefix}::A", f"{prefix}::A.B"),
+            (f"{prefix}::A.B", f"{prefix}::A.B.C"),
+            (f"{prefix}::A.B.C", f"{prefix}::A.B.C.M"),
+        } <= contains
+        assert all(source == prefix or source in qualified for source, _ in contains)
+
+        from code_review_graph.graph import GraphStore
+        from code_review_graph.tools.query import query_graph
+
+        graph_dir = tmp_path / ".code-review-graph"
+        graph_dir.mkdir()
+        store = GraphStore(graph_dir / "graph.db")
+        try:
+            store.store_file_nodes_edges(str(path), nodes, edges)
+        finally:
+            store.close()
+
+        # Addressed by qualified name; short-name lookup of a dotted nested
+        # path is a separate query-resolution change.
+        result = query_graph(
+            "children_of",
+            f"{prefix}::Details.QueryHandler",
+            repo_root=str(tmp_path),
+        )
+        assert result["status"] == "ok"
+        assert {child["name"] for child in result["results"]} == {"Handle"}
+
+    def test_incremental_upgrade_rebuilds_legacy_nested_identities(self, tmp_path):
+        from unittest.mock import patch
+
+        from code_review_graph.graph import GraphStore
+        from code_review_graph.incremental import (
+            CSHARP_IDENTITY_VERSION,
+            incremental_update,
+        )
+        from code_review_graph.parser import NodeInfo
+
+        path = tmp_path / "Nested.cs"
+        path.write_text(
+            "public class Details {\n"
+            "    public class QueryHandler { public void Handle() {} }\n"
+            "}\n"
+            "public class Edit {\n"
+            "    public class QueryHandler { public void Handle() {} }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        store = GraphStore(tmp_path / "graph.db")
+        legacy = f"{path.as_posix()}::QueryHandler.Handle"
+        try:
+            store.upsert_node(NodeInfo(
+                kind="Function",
+                name="Handle",
+                file_path=str(path),
+                line_start=2,
+                line_end=2,
+                language="csharp",
+                parent_name="QueryHandler",
+            ))
+            store.commit()
+
+            with patch(
+                "code_review_graph.incremental.get_all_tracked_files",
+                return_value=["Nested.cs"],
+            ):
+                result = incremental_update(tmp_path, store, changed_files=[])
+
+            assert result["identity_rebuild"] is True
+            assert store.get_metadata("csharp_identity_version") == (
+                CSHARP_IDENTITY_VERSION
+            )
+            assert store.get_node(legacy) is None
+            assert store.get_node(
+                f"{path.as_posix()}::Details.QueryHandler.Handle"
+            ) is not None
+            assert store.get_node(
+                f"{path.as_posix()}::Edit.QueryHandler.Handle"
+            ) is not None
+        finally:
+            store.close()
+
     @pytest.mark.parametrize(
         ("statement", "expected_targets"),
         [
@@ -971,6 +1099,112 @@ class TestCSharpReceiverCallResolution:
         "    }\n"
         "}\n"
     )
+    NESTED = (
+        "public class Details\n"
+        "{\n"
+        "    public class QueryHandler { public void Handle() { } }\n"
+        "}\n"
+        "public class Edit\n"
+        "{\n"
+        "    public class QueryHandler { public void Handle() { } }\n"
+        "}\n"
+    )
+    NESTED_CONSUMERS = (
+        "public class DetailsConsumer\n"
+        "{\n"
+        "    Details.QueryHandler handler;\n"
+        "    public void CallDetails() { handler.Handle(); }\n"
+        "}\n"
+        "public class EditConsumer\n"
+        "{\n"
+        "    Edit.QueryHandler handler;\n"
+        "    public void CallEdit() { handler.Handle(); }\n"
+        "}\n"
+        "public class AmbiguousConsumer\n"
+        "{\n"
+        "    QueryHandler handler;\n"
+        "    public void CallAmbiguous() { handler.Handle(); }\n"
+        "}\n"
+    )
+    PREFIX_COLLISION = (
+        "public class A\n"
+        "{\n"
+        "    public class B\n"
+        "    {\n"
+        "        public class C { public void M() { } }\n"
+        "    }\n"
+        "}\n"
+        "public class ExactPathConsumer\n"
+        "{\n"
+        "    B.C value;\n"
+        "    public void Call() { value.M(); }\n"
+        "}\n"
+        "public class LexicalOuter\n"
+        "{\n"
+        "    public class D\n"
+        "    {\n"
+        "        public class E { public void M() { } }\n"
+        "    }\n"
+        "    public class SuffixPathConsumer\n"
+        "    {\n"
+        "        D.E value;\n"
+        "        public void Call() { value.M(); }\n"
+        "    }\n"
+        "}\n"
+        "public class E { public void M() { } }\n"
+    )
+    EXACT_PREFIX_TARGET = (
+        "public class B\n"
+        "{\n"
+        "    public class C { public void M() { } }\n"
+        "}\n"
+    )
+    NAMESPACED = (
+        "namespace App\n"
+        "{\n"
+        "    public class Report\n"
+        "    {\n"
+        "        public class ExportHandler { public void Run() { } }\n"
+        "    }\n"
+        "}\n"
+    )
+    NAMESPACE_SUFFIX_DECOY = (
+        "public class X\n"
+        "{\n"
+        "    public class App\n"
+        "    {\n"
+        "        public class Report\n"
+        "        {\n"
+        "            public class ExportHandler { public void Run() { } }\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+    )
+    NAMESPACED_CONSUMER = (
+        "public class NamespacedConsumer\n"
+        "{\n"
+        "    App.Report.ExportHandler handler;\n"
+        "    public void Call() { handler.Run(); }\n"
+        "}\n"
+    )
+    LEXICAL_SHADOW = (
+        "public class D\n"
+        "{\n"
+        "    public class E { public void M() { } }\n"
+        "}\n"
+        "public class Shadower\n"
+        "{\n"
+        "    public class D\n"
+        "    {\n"
+        "        public class E { public void M() { } }\n"
+        "    }\n"
+        "    public class Consumer\n"
+        "    {\n"
+        "        D.E value;\n"
+        "        public void Call() { value.M(); }\n"
+        "    }\n"
+        "}\n"
+    )
 
     def _build(self, tmp_path):
         from unittest.mock import patch
@@ -987,6 +1221,14 @@ class TestCSharpReceiverCallResolution:
             "Single.cs": self.SINGLE,
             "Decoy.cs": self.DECOY,
             "ServiceTests.cs": self.TESTS,
+            "Nested.cs": self.NESTED,
+            "NestedConsumers.cs": self.NESTED_CONSUMERS,
+            "PrefixCollision.cs": self.PREFIX_COLLISION,
+            "ExactPrefixTarget.cs": self.EXACT_PREFIX_TARGET,
+            "LexicalShadow.cs": self.LEXICAL_SHADOW,
+            "Namespaced.cs": self.NAMESPACED,
+            "NamespaceSuffixDecoy.cs": self.NAMESPACE_SUFFIX_DECOY,
+            "NamespacedConsumer.cs": self.NAMESPACED_CONSUMER,
         }
         for name, content in files.items():
             (tmp_path / name).write_text(content, encoding="utf-8")
@@ -1030,6 +1272,75 @@ class TestCSharpReceiverCallResolution:
         single = str(tmp_path / "Single.cs")
         targets = self._call_targets_of(tmp_path, "Runner.Go")
         assert f"{single}::Widget.Spin" in targets
+
+    def test_nested_receiver_calls_resolve_to_distinct_methods(self, tmp_path):
+        from code_review_graph.tools.query import query_graph
+
+        self._build(tmp_path)
+        nested = str(tmp_path / "Nested.cs")
+        expected = {
+            "DetailsConsumer.CallDetails": (
+                "CallDetails", f"{nested}::Details.QueryHandler.Handle"
+            ),
+            "EditConsumer.CallEdit": (
+                "CallEdit", f"{nested}::Edit.QueryHandler.Handle"
+            ),
+        }
+        for caller, (caller_name, target) in expected.items():
+            assert self._call_targets_of(tmp_path, caller) == {target}
+            result = query_graph("callers_of", target, repo_root=str(tmp_path))
+            assert result["status"] == "ok"
+            resolved = {
+                node["name"]
+                for node in result["results"]
+                if node.get("target_resolution") != "unresolved"
+            }
+            assert resolved == {caller_name}
+
+    def test_bare_nested_receiver_stays_unresolved_when_ambiguous(self, tmp_path):
+        self._build(tmp_path)
+        assert self._call_targets_of(
+            tmp_path, "AmbiguousConsumer.CallAmbiguous",
+        ) == {"Handle"}
+
+    def test_exact_nested_receiver_beats_suffix_match(self, tmp_path):
+        self._build(tmp_path)
+        target = tmp_path / "ExactPrefixTarget.cs"
+        assert self._call_targets_of(
+            tmp_path, "ExactPathConsumer.Call",
+        ) == {f"{target.as_posix()}::B.C.M"}
+
+    def test_longer_suffix_match_beats_shorter_exact_type(self, tmp_path):
+        self._build(tmp_path)
+        target = tmp_path / "PrefixCollision.cs"
+        assert self._call_targets_of(
+            tmp_path, "LexicalOuter.SuffixPathConsumer.Call",
+        ) == {f"{target.as_posix()}::LexicalOuter.D.E.M"}
+
+    def test_enclosing_type_shadows_global_type_of_the_same_path(self, tmp_path):
+        """C# lookup starts at the innermost enclosing type, so inside
+        ``Shadower.Consumer`` the receiver ``D.E`` is ``Shadower.D.E`` even
+        though a top-level ``D.E`` also exists."""
+        self._build(tmp_path)
+        target = tmp_path / "LexicalShadow.cs"
+        assert self._call_targets_of(
+            tmp_path, "Shadower.Consumer.Call",
+        ) == {f"{target.as_posix()}::Shadower.D.E.M"}
+
+    def test_namespaced_receiver_beats_conflicting_containing_type_suffix(
+        self, tmp_path,
+    ):
+        """C# namespaces are not part of ``parent_name``, so the receiver
+        ``App.Report.ExportHandler`` only matches exactly once shortened to
+        ``Report.ExportHandler``. An unrelated nested type whose containing
+        path merely ends in ``App.Report.ExportHandler`` must not win first via
+        the suffix map -- every exact candidate is tried before any heuristic.
+        """
+        self._build(tmp_path)
+        target = tmp_path / "Namespaced.cs"
+        assert self._call_targets_of(
+            tmp_path, "NamespacedConsumer.Call",
+        ) == {f"{target.as_posix()}::Report.ExportHandler.Run"}
 
     def test_callers_of_returns_resolved_caller_after_full_build(self, tmp_path):
         from code_review_graph.tools.query import query_graph

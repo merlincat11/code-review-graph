@@ -105,6 +105,29 @@ def _fold(name: str, language: str) -> str:
     return name.casefold() if language == "php" else name
 
 
+def _csharp_scope_suffixes(name: str) -> list[str]:
+    """Return a C# type path from most to least qualified."""
+    parts = name.split(".")
+    return [".".join(parts[index:]) for index in range(len(parts))]
+
+
+def _csharp_lexical_scopes(enclosing: Optional[str], receiver: str) -> list[str]:
+    """Return the receiver resolved against each enclosing scope, innermost first.
+
+    C# name lookup starts in the innermost enclosing type and walks outward
+    before it ever considers a global type, so inside ``Outer.Consumer`` the
+    receiver ``D.E`` means ``Outer.D.E`` even when a top-level ``D.E`` exists.
+    ``("Outer.Consumer", "D.E")`` → ``["Outer.Consumer.D.E", "Outer.D.E"]``.
+    """
+    if not enclosing:
+        return []
+    parts = enclosing.split(".")
+    return [
+        ".".join(parts[: index + 1]) + f".{receiver}"
+        for index in reversed(range(len(parts)))
+    ]
+
+
 def _path_tokens(file_path: str) -> list[str]:
     """Path split into segments, with the file extension stripped off the last.
 
@@ -237,11 +260,7 @@ def _scope_and_method(
         scope, _, method = target.partition("::")
         if not scope or not method or "::" in method:
             return None
-        # Strip any namespace qualifier: ``Acme.Services.Service`` → ``Service``.
-        class_name = scope.rsplit(".", 1)[-1]
-        if not class_name:
-            return None
-        return class_name, method, False
+        return scope, method, False
 
     return None
 
@@ -275,6 +294,7 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
     # keys are case-folded for PHP only (Rust identifiers are case-sensitive).
     # ------------------------------------------------------------------
     method_map: dict[tuple[str, str, str], list[str]] = {}
+    csharp_suffix_method_map: dict[tuple[str, str, str], list[str]] = {}
     file_of: dict[str, str] = {}
     kind_placeholders = ",".join("?" for _ in _METHOD_KINDS)
     for row in conn.execute(
@@ -285,8 +305,18 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
         (*_METHOD_KINDS, *_SCOPED_LANGUAGES),
     ).fetchall():
         lang = row["language"]
-        key = (lang, _fold(row["parent_name"], lang), _fold(row["name"], lang))
+        key = (
+            lang,
+            _fold(row["parent_name"], lang),
+            _fold(row["name"], lang),
+        )
         method_map.setdefault(key, []).append(row["qualified_name"])
+        if lang == "csharp":
+            for parent_name in _csharp_scope_suffixes(row["parent_name"])[1:]:
+                suffix_key = (lang, parent_name, row["name"])
+                csharp_suffix_method_map.setdefault(suffix_key, []).append(
+                    row["qualified_name"]
+                )
         file_of[row["qualified_name"]] = row["file_path"]
 
     if not method_map:
@@ -450,9 +480,47 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
             class_name = enclosing
         assert class_name is not None  # non-enclosing parse always sets a class
 
-        candidates = method_map.get(
-            (language, _fold(class_name, language), _fold(method, language))
-        )
+        # C# resolves a receiver by binding its leading identifier lexically,
+        # then binding each following component against that entity. Approximate
+        # that with three ordered phases, every exact phase exhausted before any
+        # heuristic runs:
+        #   1. lexical  - the receiver under each enclosing type, innermost first
+        #   2. exact    - the receiver itself, then progressively shorter paths
+        #   3. suffix   - the suffix map, which matches a *containing-type tail*
+        # Phase 2 must finish before phase 3 starts. Namespaces are deliberately
+        # absent from ``parent_name`` (they live in ``csharp_namespaces_by_file``),
+        # so a namespace-qualified receiver such as ``App.Details.QueryHandler``
+        # only matches exactly once shortened to ``Details.QueryHandler``.
+        # Interleaving the phases would let an unrelated nested type whose
+        # containing path merely ends in ``App.Details.QueryHandler`` win first,
+        # and a unique-but-wrong suffix hit then bypasses the namespace
+        # disambiguator entirely. ``needs_enclosing`` targets already name the
+        # caller's own type, so they never take the lexical phase.
+        lexical_scopes: list[str] = []
+        class_names = [class_name]
+        if language == "csharp":
+            if not needs_enclosing:
+                lexical_scopes = _csharp_lexical_scopes(
+                    _enclosing_class(row["source_qualified"]), class_name,
+                )
+            class_names = _csharp_scope_suffixes(class_name)
+
+        candidates = None
+        for candidate_class in [*lexical_scopes, *class_names]:
+            candidates = method_map.get((
+                language,
+                _fold(candidate_class, language),
+                _fold(method, language),
+            ))
+            if candidates:
+                break
+        if not candidates and language == "csharp":
+            for candidate_class in class_names:
+                candidates = csharp_suffix_method_map.get((
+                    language, candidate_class, method,
+                ))
+                if candidates:
+                    break
         if not candidates:
             continue
 
