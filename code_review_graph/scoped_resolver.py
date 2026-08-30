@@ -520,12 +520,22 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
             if not found:
                 continue
             if dropped_namespace is not None:
+                # The namespace evidence is per *file*, not per node, and one C#
+                # file may declare several namespaces. Membership alone would
+                # only prove the dropped name appears somewhere in the candidate's
+                # file, not that it encloses the candidate: a file declaring both
+                # ``App`` and ``Other`` would let ``App.Ledger.AuditHandler`` bind
+                # an ``Other.Ledger.AuditHandler``. Require the file to declare
+                # exactly the dropped namespace, so the evidence is unambiguous.
+                # This leaves genuine matches in multi-namespace files unresolved,
+                # which is the right trade for a resolver that must not fabricate
+                # edges; per-node namespaces would resolve them properly.
                 found = [
                     candidate
                     for candidate in found
-                    if dropped_namespace in csharp_namespaces_by_file.get(
+                    if csharp_namespaces_by_file.get(
                         file_of.get(candidate, ""), set(),
-                    )
+                    ) == {dropped_namespace}
                 ]
                 if not found:
                     continue

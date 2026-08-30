@@ -1153,6 +1153,26 @@ class TestCSharpReceiverCallResolution:
         "}\n"
         "public class E { public void M() { } }\n"
     )
+    MULTI_NAMESPACE = (
+        "namespace App\n"
+        "{\n"
+        "    public class SomethingElse { }\n"
+        "}\n"
+        "namespace Other\n"
+        "{\n"
+        "    public class Journal\n"
+        "    {\n"
+        "        public class PostHandler { public void Post() { } }\n"
+        "    }\n"
+        "}\n"
+    )
+    MULTI_NAMESPACE_CONSUMER = (
+        "public class MultiNamespaceConsumer\n"
+        "{\n"
+        "    App.Journal.PostHandler handler;\n"
+        "    public void Call() { handler.Post(); }\n"
+        "}\n"
+    )
     WRONG_NAMESPACE = (
         "namespace Other;\n"
         "public class Ledger\n"
@@ -1256,6 +1276,8 @@ class TestCSharpReceiverCallResolution:
             "LexicalShadow.cs": self.LEXICAL_SHADOW,
             "LoneNested.cs": self.LONE_NESTED,
             "WrongNamespace.cs": self.WRONG_NAMESPACE,
+            "MultiNamespace.cs": self.MULTI_NAMESPACE,
+            "MultiNamespaceConsumer.cs": self.MULTI_NAMESPACE_CONSUMER,
             "WrongNamespaceConsumer.cs": self.WRONG_NAMESPACE_CONSUMER,
             "LoneBareConsumer.cs": self.LONE_BARE_CONSUMER,
             "Namespaced.cs": self.NAMESPACED,
@@ -1365,6 +1387,17 @@ class TestCSharpReceiverCallResolution:
         self._build(tmp_path)
         targets = self._call_targets_of(tmp_path, "WrongNamespaceConsumer.Call")
         assert targets == {"Run"}, targets
+
+    def test_dropped_namespace_must_be_the_files_only_namespace(self, tmp_path):
+        """The namespace evidence is per file, and one C# file may declare
+        several namespaces. ``Definitions.cs`` declaring both ``App`` and
+        ``Other`` proves only that ``App`` appears somewhere in the file, not
+        that it encloses ``Journal.PostHandler`` -- which actually sits in
+        ``Other``. Ambiguous evidence must not resolve the call.
+        """
+        self._build(tmp_path)
+        targets = self._call_targets_of(tmp_path, "MultiNamespaceConsumer.Call")
+        assert targets == {"Post"}, targets
 
     def test_bare_receiver_never_selects_a_nested_type(self, tmp_path):
         """A bare ``QueryHandler`` cannot name ``Details.QueryHandler`` in C#;
