@@ -54,6 +54,16 @@ def _compatible_edge_languages(language: str) -> tuple[str, ...]:
     return (language,)
 
 
+def _symbol_of(qualified_name: str) -> str:
+    """Return the symbol portion of a qualified name (after the first "::").
+
+    ``src/app.py::Handler.process`` → ``Handler.process``. A qualified name
+    without a path component is already a bare symbol.
+    """
+    _, sep, symbol = qualified_name.partition("::")
+    return symbol if sep else qualified_name
+
+
 def _bridge_qualified_name(qualified_name: str) -> str:
     """Return *qualified_name* with its file-path component POSIX-normalized.
 
@@ -88,6 +98,13 @@ CREATE TABLE IF NOT EXISTS nodes (
     is_test INTEGER DEFAULT 0,
     file_hash TEXT,
     extra TEXT DEFAULT '{}',
+    -- Symbol portion of qualified_name (everything after the first "::").
+    -- Stored so a dotted-tail lookup is an indexed equality test instead of a
+    -- substr() scan over every node; see search_nodes_by_qualified_tail.
+    -- idx_nodes_symbol is created by migration v10, not here: _init_schema runs
+    -- before run_migrations, so indexing a column this CREATE TABLE cannot add
+    -- to an existing table would break every pre-existing database on open.
+    symbol TEXT,
     updated_at REAL NOT NULL
 );
 
@@ -238,8 +255,8 @@ class GraphStore:
             """INSERT INTO nodes
                (kind, name, qualified_name, file_path, line_start, line_end,
                 language, parent_name, params, return_type, modifiers, is_test,
-                file_hash, extra, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                file_hash, extra, symbol, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(qualified_name) DO UPDATE SET
                  kind=excluded.kind, name=excluded.name,
                  file_path=excluded.file_path, line_start=excluded.line_start,
@@ -247,14 +264,15 @@ class GraphStore:
                  parent_name=excluded.parent_name, params=excluded.params,
                  return_type=excluded.return_type, modifiers=excluded.modifiers,
                  is_test=excluded.is_test, file_hash=excluded.file_hash,
-                 extra=excluded.extra, updated_at=excluded.updated_at
+                 extra=excluded.extra, symbol=excluded.symbol,
+                 updated_at=excluded.updated_at
             """,
             (
                 node.kind, node.name, qualified, node.file_path,
                 node.line_start, node.line_end, node.language,
                 node.parent_name, node.params, node.return_type,
                 node.modifiers, int(node.is_test), file_hash,
-                extra, now,
+                extra, _symbol_of(qualified), now,
             ),
         )
         row = self._conn.execute(
@@ -1209,6 +1227,30 @@ class GraphStore:
             "SELECT file_path FROM nodes WHERE kind = 'File' ORDER BY file_path"
         ).fetchall()
         return [row["file_path"] for row in rows]
+
+    def search_nodes_by_qualified_tail(
+        self, tail: str, limit: int = 20,
+    ) -> list[GraphNode]:
+        """Return nodes whose qualified symbol portion exactly matches *tail*.
+
+        Both predicates are indexed equality tests (``idx_nodes_symbol`` and the
+        ``qualified_name`` unique index), so this stays a bounded lookup rather
+        than a scan of every node on large graphs.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM nodes WHERE symbol = ? OR qualified_name = ? LIMIT ?",
+            (tail, tail, limit),
+        ).fetchall()
+        return [self._row_to_node(row) for row in rows]
+
+    def count_nodes_by_qualified_tail(self, tail: str) -> int:
+        """Count nodes whose qualified symbol portion exactly matches *tail*."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS count FROM nodes "
+            "WHERE symbol = ? OR qualified_name = ?",
+            (tail, tail),
+        ).fetchone()
+        return int(row["count"])
 
     def search_nodes(self, query: str, limit: int = 20) -> list[GraphNode]:
         """Keyword search across node names.

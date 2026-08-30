@@ -34,7 +34,7 @@ When using code-review-graph MCP tools, follow these rules:
   - `wiki.py` — Markdown wiki generation from community structure
   - `skills.py` — Multi-platform install/config generation and shipped skill metadata
   - `registry.py` — Multi-repo registry helpers
-  - `migrations.py` — Database schema migrations (v1-v9)
+  - `migrations.py` — Database schema migrations (v1-v10)
   - `tsconfig_resolver.py` — TypeScript path alias resolution
 
 - **VS Code Extension**: `code-review-graph-vscode/` (TypeScript)

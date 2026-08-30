@@ -48,7 +48,7 @@ _QUERY_PATTERNS = {
 }
 
 _JAVA_FQN_PART = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
-_MAX_FQN_CANDIDATES = 100
+_MAX_DOTTED_TARGET_CANDIDATES = 100
 
 
 def _looks_like_java_method_fqn(target: str) -> bool:
@@ -76,7 +76,9 @@ def _java_fqn_candidates(store: GraphStore, target: str) -> list[GraphNode] | No
     parts = target.split(".")
     class_name, method_name = parts[-2:]
     matches: list[GraphNode] = []
-    for candidate in store.search_nodes(method_name, limit=_MAX_FQN_CANDIDATES):
+    for candidate in store.search_nodes(
+        method_name, limit=_MAX_DOTTED_TARGET_CANDIDATES,
+    ):
         if candidate.language.lower() != "java" or candidate.name != method_name:
             continue
         parent_name = candidate.parent_name or ""
@@ -328,12 +330,35 @@ def query_graph(
                 abs_target = normalize_file_path(root / target)
                 node = store.get_node(abs_target)
             if not node:
+                qualified_tail_candidates = []
+                if "." in target:
+                    # Nested type paths are exact indexed tails but also look
+                    # Java-shaped; recognize the exact node before the Java
+                    # FQN guard, without changing bare-name disambiguation.
+                    qualified_tail_candidates = (
+                        store.search_nodes_by_qualified_tail(
+                            target, limit=_MAX_DOTTED_TARGET_CANDIDATES,
+                        )
+                    )
                 java_candidates = _java_fqn_candidates(store, target)
-                candidates = (
-                    java_candidates
-                    if java_candidates is not None
-                    else store.search_nodes(target, limit=20)
-                )
+                if java_candidates:
+                    # Established behavior: a Java-shaped target that has real
+                    # Java matches resolves against Java, and the unfiltered
+                    # tail lookup never gets to displace it.
+                    candidates = java_candidates
+                elif qualified_tail_candidates:
+                    # No Java match. An exact qualified-tail hit is a structural
+                    # match on the whole symbol path, not the fuzzy global-name
+                    # fallback the Java guard exists to block, so it is safe to
+                    # use here. This is what makes C# nested paths such as
+                    # ``Details.QueryHandler.Handle`` addressable (#934); they
+                    # are Java-FQN-shaped and have no Java candidates.
+                    candidates = qualified_tail_candidates
+                elif java_candidates is not None:
+                    # Java-shaped with no safe match: do not fall back.
+                    candidates = []
+                else:
+                    candidates = store.search_nodes(target, limit=20)
                 if pattern == "inheritors_of" and "::" not in target:
                     exact_type_candidates = [
                         candidate
@@ -348,11 +373,17 @@ def query_graph(
                     node = candidates[0]
                     target = node.qualified_name
                 elif len(candidates) > 1:
-                    candidate_count = (
-                        len(candidates)
-                        if java_candidates is not None
-                        else store.count_search_nodes(target)
-                    )
+                    # Count the population the candidates were drawn from, not
+                    # the truncated slice, so candidates_truncated stays honest
+                    # when more than _MAX_DOTTED_TARGET_CANDIDATES nodes match.
+                    if java_candidates:
+                        candidate_count = len(candidates)
+                    elif qualified_tail_candidates:
+                        candidate_count = store.count_nodes_by_qualified_tail(target)
+                    elif java_candidates is not None:
+                        candidate_count = len(candidates)
+                    else:
+                        candidate_count = store.count_search_nodes(target)
                     ranked = _rank_disambiguation_candidates(candidates, target)
                     return {
                         "status": "ambiguous",
