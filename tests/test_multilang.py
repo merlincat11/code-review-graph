@@ -4676,3 +4676,64 @@ class TestAnsibleMetaParsing:
     def test_depends_on_name_key_collections(self):
         dep_targets = {e.target for e in self.edges if e.kind == "DEPENDS_ON"}
         assert "security.hardening" in dep_targets
+
+
+def test_incremental_upgrade_rebuilds_legacy_generic_inheritance(tmp_path):
+    """A graph built before this change still spells the target GenericBase<string>.
+
+    Nothing reparses an unchanged file, so without an identity version the
+    stale target would survive the upgrade and #935 would persist.
+    """
+    from unittest.mock import patch
+
+    from code_review_graph.graph import GraphStore
+    from code_review_graph.incremental import (
+        INHERITS_IDENTITY_VERSION,
+        incremental_update,
+    )
+    from code_review_graph.parser import EdgeInfo, NodeInfo
+
+    source_path = tmp_path / "Bases.cs"
+    source_path.write_text(
+        "public abstract class GenericBase<T> { }\n"
+        "public class FromGeneric : GenericBase<string> { }\n",
+        encoding="utf-8",
+    )
+    store = GraphStore(tmp_path / "graph.db")
+    try:
+        for name in ("GenericBase", "FromGeneric"):
+            store.upsert_node(NodeInfo(
+                kind="Class",
+                name=name,
+                file_path=str(source_path),
+                line_start=1,
+                line_end=1,
+                language="csharp",
+            ))
+        store.upsert_edge(EdgeInfo(
+            kind="INHERITS",
+            source=f"{source_path.as_posix()}::FromGeneric",
+            target="GenericBase<string>",
+            file_path=str(source_path),
+            line=2,
+        ))
+        store.commit()
+
+        with patch(
+            "code_review_graph.incremental.get_all_tracked_files",
+            return_value=["Bases.cs"],
+        ):
+            result = incremental_update(tmp_path, store, changed_files=[])
+
+        assert result["identity_rebuild"] is True
+        assert store.get_metadata("inherits_identity_version") == INHERITS_IDENTITY_VERSION
+        targets = [
+            edge.target_qualified
+            for edge in store.get_edges_by_source(
+                f"{source_path.as_posix()}::FromGeneric"
+            )
+            if edge.kind == "INHERITS"
+        ]
+        assert targets == ["GenericBase"]
+    finally:
+        store.close()
