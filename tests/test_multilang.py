@@ -1153,6 +1153,20 @@ class TestCSharpReceiverCallResolution:
         "}\n"
         "public class E { public void M() { } }\n"
     )
+    WRONG_NAMESPACE = (
+        "namespace Other;\n"
+        "public class Ledger\n"
+        "{\n"
+        "    public class AuditHandler { public void Run() { } }\n"
+        "}\n"
+    )
+    WRONG_NAMESPACE_CONSUMER = (
+        "public class WrongNamespaceConsumer\n"
+        "{\n"
+        "    App.Ledger.AuditHandler handler;\n"
+        "    public void Call() { handler.Run(); }\n"
+        "}\n"
+    )
     LONE_NESTED = (
         "public class Wrapper\n"
         "{\n"
@@ -1241,6 +1255,8 @@ class TestCSharpReceiverCallResolution:
             "ExactPrefixTarget.cs": self.EXACT_PREFIX_TARGET,
             "LexicalShadow.cs": self.LEXICAL_SHADOW,
             "LoneNested.cs": self.LONE_NESTED,
+            "WrongNamespace.cs": self.WRONG_NAMESPACE,
+            "WrongNamespaceConsumer.cs": self.WRONG_NAMESPACE_CONSUMER,
             "LoneBareConsumer.cs": self.LONE_BARE_CONSUMER,
             "Namespaced.cs": self.NAMESPACED,
             "NamespaceSuffixDecoy.cs": self.NAMESPACE_SUFFIX_DECOY,
@@ -1336,6 +1352,19 @@ class TestCSharpReceiverCallResolution:
         assert self._call_targets_of(
             tmp_path, "LexicalOuter.SuffixPathConsumer.Call",
         ) == {f"{target.as_posix()}::LexicalOuter.D.E.M"}
+
+    def test_shortened_receiver_requires_the_dropped_part_to_be_a_namespace(
+        self, tmp_path,
+    ):
+        """``App.Ledger.AuditHandler`` is stored as ``Ledger.AuditHandler``
+        only when ``App`` is the defining file's namespace. The one indexed
+        candidate here sits in namespace ``Other``, so dropping ``App`` to reach
+        it would bind a type the source never asked for; C# resolves the leading
+        identifier first and never restarts at a later component.
+        """
+        self._build(tmp_path)
+        targets = self._call_targets_of(tmp_path, "WrongNamespaceConsumer.Call")
+        assert targets == {"Run"}, targets
 
     def test_bare_receiver_never_selects_a_nested_type(self, tmp_path):
         """A bare ``QueryHandler`` cannot name ``Details.QueryHandler`` in C#;

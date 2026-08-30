@@ -473,42 +473,64 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
             class_name = enclosing
         assert class_name is not None  # non-enclosing parse always sets a class
 
-        # C# resolves a receiver by binding its leading identifier lexically,
-        # then binding each following component against that entity. Two ordered
-        # phases approximate that, and both match a containing-type path exactly:
-        #   1. lexical - the receiver under each enclosing type, innermost first
-        #   2. exact   - the receiver itself, then progressively shorter paths
-        # Phase 2 exists because namespaces are deliberately absent from
-        # ``parent_name`` (they live in ``csharp_namespaces_by_file``), so a
-        # namespace-qualified receiver such as ``App.Details.QueryHandler`` only
-        # matches once shortened to ``Details.QueryHandler``.
+        # C# resolves a receiver by binding its leading identifier to a
+        # namespace or type, then binding each later component relative to what
+        # preceded it. It never discards a leading component and restarts.
         #
-        # There is deliberately no containing-type *suffix* fallback. Selecting a
-        # nested type from a bare receiver would bind names C# cannot bind: a bare
-        # ``QueryHandler`` does not name ``Details.QueryHandler``, which has to be
-        # qualified, so a lone indexed candidate would otherwise be rewritten as a
-        # single match with no visibility check at all. Leaving such a receiver
-        # unresolved is correct; the type may well live in a dependency that was
-        # never indexed. ``needs_enclosing`` targets already name the caller's own
-        # type, so they never take the lexical phase.
-        lexical_scopes: list[str] = []
-        class_names = [class_name]
+        # Two ordered phases approximate that. Both match a containing-type path
+        # exactly; there is no suffix fallback, because selecting a nested type
+        # from a bare receiver would bind names C# cannot bind.
+        #   1. lexical - the receiver under each enclosing type, innermost first
+        #   2. exact   - the receiver, then forms with a leading namespace removed
+        #
+        # Phase 2 exists only because namespaces are absent from ``parent_name``
+        # (they live in ``csharp_namespaces_by_file``), so a namespace-qualified
+        # receiver such as ``App.Report.ExportHandler`` is stored as
+        # ``Report.ExportHandler``. Every shortened form therefore has to prove
+        # the part it dropped really is a namespace of the candidate's defining
+        # file. Without that check the resolver would happily strip ``App`` and
+        # bind a ``Report.ExportHandler`` sitting in namespace ``Other`` -- a
+        # single candidate takes the single_match path, so nothing downstream
+        # would catch it. ``needs_enclosing`` targets already name the caller's
+        # own type, so they never take the lexical phase.
+        lookups: list[tuple[str, Optional[str]]] = []
         if language == "csharp":
             if not needs_enclosing:
-                lexical_scopes = _csharp_lexical_scopes(
-                    _enclosing_class(row["source_qualified"]), class_name,
+                lookups.extend(
+                    (scope, None)
+                    for scope in _csharp_lexical_scopes(
+                        _enclosing_class(row["source_qualified"]), class_name,
+                    )
                 )
-            class_names = _csharp_scope_suffixes(class_name)
+            parts = class_name.split(".")
+            lookups.extend(
+                (".".join(parts[index:]), ".".join(parts[:index]) or None)
+                for index in range(len(parts))
+            )
+        else:
+            lookups.append((class_name, None))
 
         candidates = None
-        for candidate_class in [*lexical_scopes, *class_names]:
-            candidates = method_map.get((
+        for candidate_class, dropped_namespace in lookups:
+            found = method_map.get((
                 language,
                 _fold(candidate_class, language),
                 _fold(method, language),
             ))
-            if candidates:
-                break
+            if not found:
+                continue
+            if dropped_namespace is not None:
+                found = [
+                    candidate
+                    for candidate in found
+                    if dropped_namespace in csharp_namespaces_by_file.get(
+                        file_of.get(candidate, ""), set(),
+                    )
+                ]
+                if not found:
+                    continue
+            candidates = found
+            break
         if not candidates:
             continue
 
