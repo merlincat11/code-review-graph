@@ -1153,6 +1153,23 @@ class TestCSharpReceiverCallResolution:
         "}\n"
         "public class E { public void M() { } }\n"
     )
+    WRONG_NAMESPACE_EXACT_PATH = (
+        "namespace Other;\n"
+        "public class Vault\n"
+        "{\n"
+        "    public class Archive\n"
+        "    {\n"
+        "        public class StoreHandler { public void Store() { } }\n"
+        "    }\n"
+        "}\n"
+    )
+    WRONG_NAMESPACE_EXACT_CONSUMER = (
+        "public class ExactPathNamespaceConsumer\n"
+        "{\n"
+        "    Vault.Archive.StoreHandler handler;\n"
+        "    public void Call() { handler.Store(); }\n"
+        "}\n"
+    )
     MULTI_NAMESPACE = (
         "namespace App\n"
         "{\n"
@@ -1277,6 +1294,8 @@ class TestCSharpReceiverCallResolution:
             "LoneNested.cs": self.LONE_NESTED,
             "WrongNamespace.cs": self.WRONG_NAMESPACE,
             "MultiNamespace.cs": self.MULTI_NAMESPACE,
+            "WrongNamespaceExactPath.cs": self.WRONG_NAMESPACE_EXACT_PATH,
+            "WrongNamespaceExactConsumer.cs": self.WRONG_NAMESPACE_EXACT_CONSUMER,
             "MultiNamespaceConsumer.cs": self.MULTI_NAMESPACE_CONSUMER,
             "WrongNamespaceConsumer.cs": self.WRONG_NAMESPACE_CONSUMER,
             "LoneBareConsumer.cs": self.LONE_BARE_CONSUMER,
@@ -1398,6 +1417,21 @@ class TestCSharpReceiverCallResolution:
         self._build(tmp_path)
         targets = self._call_targets_of(tmp_path, "MultiNamespaceConsumer.Call")
         assert targets == {"Post"}, targets
+
+    def test_exact_path_match_still_checks_the_candidate_namespace(
+        self, tmp_path,
+    ):
+        """An exact containing-type match is not an exact *type* match, because
+        namespaces are absent from ``parent_name``. ``Vault.Archive.StoreHandler``
+        declared inside ``namespace Other`` is keyed exactly as the receiver
+        spells it, yet the caller means a different type entirely and cannot see
+        ``Other``. Matching the path alone would fabricate the edge.
+        """
+        self._build(tmp_path)
+        targets = self._call_targets_of(
+            tmp_path, "ExactPathNamespaceConsumer.Call",
+        )
+        assert targets == {"Store"}, targets
 
     def test_bare_receiver_never_selects_a_nested_type(self, tmp_path):
         """A bare ``QueryHandler`` cannot name ``Details.QueryHandler`` in C#;
