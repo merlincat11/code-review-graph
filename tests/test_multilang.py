@@ -1153,6 +1153,20 @@ class TestCSharpReceiverCallResolution:
         "}\n"
         "public class E { public void M() { } }\n"
     )
+    LONE_NESTED = (
+        "public class Wrapper\n"
+        "{\n"
+        "    public class LoneHandler { public void Handle() { } }\n"
+        "}\n"
+    )
+    LONE_BARE_CONSUMER = (
+        "using External;\n"
+        "public class LoneBareConsumer\n"
+        "{\n"
+        "    LoneHandler handler;\n"
+        "    public void Call() { handler.Handle(); }\n"
+        "}\n"
+    )
     EXACT_PREFIX_TARGET = (
         "public class B\n"
         "{\n"
@@ -1226,6 +1240,8 @@ class TestCSharpReceiverCallResolution:
             "PrefixCollision.cs": self.PREFIX_COLLISION,
             "ExactPrefixTarget.cs": self.EXACT_PREFIX_TARGET,
             "LexicalShadow.cs": self.LEXICAL_SHADOW,
+            "LoneNested.cs": self.LONE_NESTED,
+            "LoneBareConsumer.cs": self.LONE_BARE_CONSUMER,
             "Namespaced.cs": self.NAMESPACED,
             "NamespaceSuffixDecoy.cs": self.NAMESPACE_SUFFIX_DECOY,
             "NamespacedConsumer.cs": self.NAMESPACED_CONSUMER,
@@ -1310,12 +1326,25 @@ class TestCSharpReceiverCallResolution:
             tmp_path, "ExactPathConsumer.Call",
         ) == {f"{target.as_posix()}::B.C.M"}
 
-    def test_longer_suffix_match_beats_shorter_exact_type(self, tmp_path):
+    def test_enclosing_scope_resolves_receiver_over_shorter_global_type(
+        self, tmp_path,
+    ):
+        """``D.E`` inside ``LexicalOuter`` binds to ``LexicalOuter.D.E`` through
+        the lexical phase, not to the shorter top-level ``E``."""
         self._build(tmp_path)
         target = tmp_path / "PrefixCollision.cs"
         assert self._call_targets_of(
             tmp_path, "LexicalOuter.SuffixPathConsumer.Call",
         ) == {f"{target.as_posix()}::LexicalOuter.D.E.M"}
+
+    def test_bare_receiver_never_selects_a_nested_type(self, tmp_path):
+        """A bare ``QueryHandler`` cannot name ``Details.QueryHandler`` in C#;
+        it has to be qualified. Even as the only indexed candidate it must stay
+        unresolved -- the real type may be in an unindexed dependency.
+        """
+        self._build(tmp_path)
+        targets = self._call_targets_of(tmp_path, "LoneBareConsumer.Call")
+        assert targets == {"Handle"}, targets
 
     def test_enclosing_type_shadows_global_type_of_the_same_path(self, tmp_path):
         """C# lookup starts at the innermost enclosing type, so inside

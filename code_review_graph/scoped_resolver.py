@@ -294,7 +294,6 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
     # keys are case-folded for PHP only (Rust identifiers are case-sensitive).
     # ------------------------------------------------------------------
     method_map: dict[tuple[str, str, str], list[str]] = {}
-    csharp_suffix_method_map: dict[tuple[str, str, str], list[str]] = {}
     file_of: dict[str, str] = {}
     kind_placeholders = ",".join("?" for _ in _METHOD_KINDS)
     for row in conn.execute(
@@ -311,12 +310,6 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
             _fold(row["name"], lang),
         )
         method_map.setdefault(key, []).append(row["qualified_name"])
-        if lang == "csharp":
-            for parent_name in _csharp_scope_suffixes(row["parent_name"])[1:]:
-                suffix_key = (lang, parent_name, row["name"])
-                csharp_suffix_method_map.setdefault(suffix_key, []).append(
-                    row["qualified_name"]
-                )
         file_of[row["qualified_name"]] = row["file_path"]
 
     if not method_map:
@@ -481,21 +474,23 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
         assert class_name is not None  # non-enclosing parse always sets a class
 
         # C# resolves a receiver by binding its leading identifier lexically,
-        # then binding each following component against that entity. Approximate
-        # that with three ordered phases, every exact phase exhausted before any
-        # heuristic runs:
-        #   1. lexical  - the receiver under each enclosing type, innermost first
-        #   2. exact    - the receiver itself, then progressively shorter paths
-        #   3. suffix   - the suffix map, which matches a *containing-type tail*
-        # Phase 2 must finish before phase 3 starts. Namespaces are deliberately
-        # absent from ``parent_name`` (they live in ``csharp_namespaces_by_file``),
-        # so a namespace-qualified receiver such as ``App.Details.QueryHandler``
-        # only matches exactly once shortened to ``Details.QueryHandler``.
-        # Interleaving the phases would let an unrelated nested type whose
-        # containing path merely ends in ``App.Details.QueryHandler`` win first,
-        # and a unique-but-wrong suffix hit then bypasses the namespace
-        # disambiguator entirely. ``needs_enclosing`` targets already name the
-        # caller's own type, so they never take the lexical phase.
+        # then binding each following component against that entity. Two ordered
+        # phases approximate that, and both match a containing-type path exactly:
+        #   1. lexical - the receiver under each enclosing type, innermost first
+        #   2. exact   - the receiver itself, then progressively shorter paths
+        # Phase 2 exists because namespaces are deliberately absent from
+        # ``parent_name`` (they live in ``csharp_namespaces_by_file``), so a
+        # namespace-qualified receiver such as ``App.Details.QueryHandler`` only
+        # matches once shortened to ``Details.QueryHandler``.
+        #
+        # There is deliberately no containing-type *suffix* fallback. Selecting a
+        # nested type from a bare receiver would bind names C# cannot bind: a bare
+        # ``QueryHandler`` does not name ``Details.QueryHandler``, which has to be
+        # qualified, so a lone indexed candidate would otherwise be rewritten as a
+        # single match with no visibility check at all. Leaving such a receiver
+        # unresolved is correct; the type may well live in a dependency that was
+        # never indexed. ``needs_enclosing`` targets already name the caller's own
+        # type, so they never take the lexical phase.
         lexical_scopes: list[str] = []
         class_names = [class_name]
         if language == "csharp":
@@ -514,13 +509,6 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
             ))
             if candidates:
                 break
-        if not candidates and language == "csharp":
-            for candidate_class in class_names:
-                candidates = csharp_suffix_method_map.get((
-                    language, candidate_class, method,
-                ))
-                if candidates:
-                    break
         if not candidates:
             continue
 
