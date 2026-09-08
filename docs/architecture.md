@@ -108,7 +108,9 @@ byte offsets, innermost first. Compilation-unit scope uses offset `-1`. Reopened
 bodies with the same namespace name have different offsets, so an ordinary using
 cannot leak between them. File-scoped namespaces include all following members,
 including grammars that represent those members as siblings. `source_offset`
-distinguishes edges on the same source line without a schema migration.
+distinguishes both receiver evidence and stored edges on the same source line
+without a schema migration. Calls also retain `csharp_containing_type` so field
+and property initializers keep their lexical context when their graph caller is a File.
 
 The resolver selects a receiver type before looking up its method. It checks
 enclosing types, enclosing namespaces, and imports at their actual lexical scopes;
@@ -134,9 +136,10 @@ these calls, including unchanged callers. `TESTED_BY` mirrors move with their ca
 Before deleting a callee file, incoming managed calls return to their raw references
 so recreating a declaration can resolve them again.
 
-`CSHARP_IDENTITY_VERSION = "2"` upgrades both the old namespace-free format and the
-nested-type-only format proposed in #937. Incremental updates reparse existing C#
-files despite matching hashes. The attempted version is recorded together with
+`CSHARP_IDENTITY_VERSION = "3"` upgrades the old namespace-free format, the
+nested-type-only format proposed in #937, and graphs lacking per-call lexical
+context. Incremental updates reparse existing C# files despite matching hashes.
+The attempted version is recorded together with
 failed file paths; subsequent updates retry those files alone and preserve their
 last stored data until parsing succeeds. This avoids extending #944's repeated
 full-rebuild loop. No SQL migration attempts to reconstruct missing source identity.

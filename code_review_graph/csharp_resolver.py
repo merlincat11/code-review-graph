@@ -127,7 +127,9 @@ def resolve_csharp_calls(store: GraphStore, repo_root: Path | None = None) -> di
 
     def type_targets(raw: str, owner: str, scopes: list, file: str) -> list[str]:
         absolute = raw.startswith("global::")
-        raw = raw.removeprefix("global::")
+        # Nullable receivers use the underlying declaration for member lookup;
+        # the original annotation remains in the call's stored evidence.
+        raw = raw.removeprefix("global::").removesuffix("?")
         # Keep generic arguments lossless; erasure could select a different
         # declaration (I vs I<T>). Generic binding belongs to #943.
         if not all(part.isidentifier() for part in raw.split(".")):
@@ -186,7 +188,10 @@ def resolve_csharp_calls(store: GraphStore, repo_root: Path | None = None) -> di
         scopes = extra.get("csharp_scopes")
         if not scopes:
             return []
-        owner = parents.get(row["source_qualified"], "")
+        # Initializers have a File caller but still belong to a lexical type.
+        owner = extra.get("csharp_containing_type") or parents.get(
+            row["source_qualified"], scopes[0][0],
+        )
         kind = extra.get("csharp_call_kind")
         method = extra["csharp_raw_target"].rsplit("::", 1)[-1]
         receiver = extra.get("receiver_scope", "")

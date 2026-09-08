@@ -5127,8 +5127,9 @@ class CodeParser:
     ) -> dict[tuple[int, str, str], tuple[str, str, str]]:
         """Collect evidence-backed targets for calls on typed receivers.
 
-        The result is keyed by source line, receiver, and method so the normal
-        call extractor remains the single producer of CALLS edges. Statically
+        The result is keyed by source position, receiver, and method so the normal
+        call extractor remains the single producer of CALLS edges. C# uses byte
+        offsets to distinguish lexical bindings on the same line. Statically
         typed receivers resolve directly when their class is repository-local.
         PHP variables assigned from ``new Type`` retain a bare parse-time target
         plus the constructed class scope for conservative graph-wide resolution.
@@ -5239,7 +5240,11 @@ class CodeParser:
                             defined_names,
                         )
                         if target:
-                            key = (node.start_point[0] + 1, receiver, method)
+                            position = (
+                                node.start_byte if language == "csharp"
+                                else node.start_point[0] + 1
+                            )
+                            key = (position, receiver, method)
                             targets[key] = (target, type_name, evidence)
 
             for child in node.children:
@@ -5598,7 +5603,8 @@ class CodeParser:
         for edge in edges:
             receiver = edge.extra.get("receiver")
             method = edge.target.rsplit(".", 1)[-1].rsplit("::", 1)[-1]
-            evidence = targets.get((edge.line, receiver, method)) if receiver else None
+            position = edge.extra.get("source_offset", -1) if language == "csharp" else edge.line
+            evidence = targets.get((position, receiver, method)) if receiver else None
             if edge.kind == "CALLS" and evidence:
                 target, type_name, evidence_kind = evidence
                 extra = dict(edge.extra)
@@ -10961,6 +10967,7 @@ class CodeParser:
                     "source_offset": child.start_byte,
                     "csharp_raw_target": call_name,
                     "csharp_scopes": _csharp_namespace_context(child),
+                    "csharp_containing_type": enclosing_class,
                     "csharp_call_kind": (
                         "constructor" if child.type == "object_creation_expression"
                         else "unqualified" if callee is not None and callee.type == "identifier"

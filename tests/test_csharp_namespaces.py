@@ -157,6 +157,85 @@ class Caller { void Go() { A.Outer.Inner.Run(); B.Outer.Inner.Run(); } }
         ]
 
 
+@pytest.mark.parametrize(("declaration", "expected_file", "expected_name"), [
+    ("class C { static int Value = Service.Run(); }", "App.cs", "App.Service.Run"),
+    ("class C { static int Value { get; } = Service.Run(); }", "App.cs", "App.Service.Run"),
+    (
+        "class Outer { public class Service { public static int Run() => 3; } "
+        "class C { static int Value = Service.Run(); } }",
+        "Caller.cs", "App.Outer.Service.Run",
+    ),
+    (
+        "class C { static int Init() => 3; static int Value = Init(); }",
+        "Caller.cs", "App.C.Init",
+    ),
+])
+def test_initializers_keep_lexical_type_context(
+    tmp_path, declaration, expected_file, expected_name,
+):
+    with _build(tmp_path, {
+        "Global.cs": "public class Service { public static int Run() => 1; }",
+        "App.cs": "namespace App; public class Service { public static int Run() => 2; }",
+        "Caller.cs": "namespace App; " + declaration,
+    }) as store:
+        calls = store._conn.execute(
+            "SELECT * FROM edges WHERE kind = 'CALLS' AND source_qualified = ?",
+            (str(tmp_path / "Caller.cs"),),
+        ).fetchall()
+        assert len(calls) == 1
+        assert calls[0]["target_qualified"] == f"{tmp_path / expected_file}::{expected_name}"
+
+
+@pytest.mark.parametrize("type_name", ["Service?", "global::Other.Service?", "Service<int>?"])
+def test_nullable_receivers_keep_raw_spelling_and_generic_boundaries(tmp_path, type_name):
+    with _build(tmp_path, {
+        "Service.cs": "namespace Other; public class Service { public void Run() {} }",
+        "Generic.cs": "namespace Other; public class Service<T> { public void Run() {} }",
+        "Caller.cs": (
+            "#nullable enable\nusing Other; namespace App; class C { "
+            f"{type_name} field; void Go({type_name} value) {{ {type_name} local = value; "
+            "value?.Run(); field.Run(); local?.Run(); } }"
+        ),
+    }) as store:
+        calls = _calls(store, "App.C.Go")
+        assert len(calls) == 3
+        for call in calls:
+            extra = json.loads(call["extra"])
+            assert extra["receiver_type"] == type_name
+            assert extra["csharp_raw_target"] == f"{type_name}::Run"
+            if "<" in type_name:
+                assert call["target_qualified"] == extra["csharp_raw_target"]
+                assert "unresolved_targets" in extra
+            else:
+                assert call["target_qualified"] == f"{tmp_path / 'Service.cs'}::Other.Service.Run"
+                assert "unresolved_targets" not in extra
+
+
+@pytest.mark.parametrize("separator", [" ", "\n"])
+def test_typed_receiver_evidence_and_test_mirrors_follow_each_call(tmp_path, separator):
+    with _build(tmp_path, {
+        "A.cs": "namespace A; public class Service { public void Run() {} }",
+        "B.cs": "namespace B; public class Service { public void Run() {} }",
+        "CallerTests.cs": (
+            "// π makes byte offsets differ from character offsets.\n"
+            "class CallerTests { void TestRun() { "
+            "{ A.Service s = new A.Service(); s.Run(); }" + separator
+            + "{ B.Service s = new B.Service(); s.Run(); } } }"
+        ),
+    }) as store:
+        calls = [
+            call for call in _calls(store, "CallerTests.TestRun")
+            if json.loads(call["extra"])["csharp_call_kind"] != "constructor"
+        ]
+        expected = [f"{tmp_path / (ns + '.cs')}::{ns}.Service.Run" for ns in ("A", "B")]
+        assert [call["target_qualified"] for call in calls] == expected
+        mirrors = store._conn.execute(
+            "SELECT source_qualified FROM edges WHERE kind = 'TESTED_BY' "
+            "AND source_qualified LIKE '%.Run' ORDER BY id",
+        ).fetchall()
+        assert [row[0] for row in mirrors] == expected
+
+
 def test_repeated_usings_on_one_line_retain_both_namespace_bodies(tmp_path):
     with _build(tmp_path, {"Case.cs":
         "namespace Other { class S { public static void Run() {} } } "
@@ -291,23 +370,29 @@ def test_global_alias_requires_known_shared_project_ownership(tmp_path, ambiguou
             assert target.endswith("::Other.Service.Run")
 
 
-def test_upgrade_retries_only_failed_files_and_bypasses_unchanged_hash(tmp_path):
+@pytest.mark.parametrize("stored_version", ["1", "2"])
+def test_upgrade_retries_only_failed_files_and_bypasses_unchanged_hash(tmp_path, stored_version):
     with _build(tmp_path, {
-        "Good.cs": "namespace Good; class C { public void Run() {} }",
+        "Good.cs": "namespace Good; class C { static int Run() => 1; static int Value = Run(); }",
         "Bad.cs": "namespace Bad; class C { public void Run() {} }",
         "untouched.py": "def f(): pass",
     }) as store:
-        store.set_metadata("csharp_identity_version", "1")
-        # Seed the actual legacy format while retaining the current file hash.
+        store.set_metadata("csharp_identity_version", stored_version)
+        # Seed old identities or call context while retaining the current hash.
         for name in ("Good", "Bad"):
             path = tmp_path / f"{name}.cs"
             nodes, edges = CodeParser().parse_file(path)
-            for node in nodes:
-                node.parent_name = (node.parent_name or "").removeprefix(name).lstrip(".") or None
-                node.extra.pop("csharp_namespace", None)
+            if stored_version == "1":
+                for node in nodes:
+                    node.parent_name = (
+                        (node.parent_name or "").removeprefix(name).lstrip(".") or None
+                    )
+                    node.extra.pop("csharp_namespace", None)
             for edge in edges:
-                edge.source = edge.source.replace(f"::{name}.", "::")
-                edge.target = edge.target.replace(f"::{name}.", "::")
+                if stored_version == "1":
+                    edge.source = edge.source.replace(f"::{name}.", "::")
+                    edge.target = edge.target.replace(f"::{name}.", "::")
+                edge.extra.pop("csharp_containing_type", None)
             store.store_file_nodes_edges(
                 str(path), nodes, edges, hashlib.sha256(path.read_bytes()).hexdigest(),
             )
@@ -326,6 +411,9 @@ def test_upgrade_retries_only_failed_files_and_bypasses_unchanged_hash(tmp_path)
             assert set(attempts) == {"Good.cs", "Bad.cs"}
             assert store.get_node(f"{tmp_path / 'Good.cs'}::Good.C.Run") is not None
             assert store.get_node(f"{tmp_path / 'Good.cs'}::C.Run") is None
+            call = store._conn.execute("SELECT * FROM edges WHERE kind = 'CALLS'").fetchone()
+            assert call["target_qualified"] == f"{tmp_path / 'Good.cs'}::Good.C.Run"
+            assert json.loads(call["extra"])["csharp_containing_type"] == "Good.C"
             attempts.clear()
             retried = incremental_update(tmp_path, store, changed_files=[])
             assert attempts == ["Bad.cs"]
