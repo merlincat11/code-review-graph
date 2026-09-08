@@ -93,6 +93,60 @@ Nodes are uniquely identified by qualified names:
 - Functions: `file_path::function_name` (e.g., `/repo/src/auth.py::authenticate`)
 - Methods: `file_path::ClassName.method_name` (e.g., `/repo/src/auth.py::AuthService.login`)
 
+### C# namespace identity and binding
+
+C# declarations include their namespace and complete containing-type path:
+`/repo/Handlers.cs::App.Report.ExportHandler.Run`. `parent_name` contains
+`App.Report.ExportHandler`; `extra.csharp_namespace` separately records `App`.
+This distinguishes types in different namespaces even when they occupy the same
+file. Namespace strings remain metadata, not synthetic graph nodes. The existing
+file-level `csharp_namespaces` list remains available for file import/impact queries.
+
+Parsing records facts; `csharp_resolver.py` binds calls after storage. C# calls and
+imports carry `csharp_scopes`, ordered pairs of namespace names and namespace-body
+byte offsets, innermost first. Compilation-unit scope uses offset `-1`. Reopened
+bodies with the same namespace name have different offsets, so an ordinary using
+cannot leak between them. File-scoped namespaces include all following members,
+including grammars that represent those members as siblings. `source_offset`
+distinguishes edges on the same source line without a schema migration.
+
+The resolver selects a receiver type before looking up its method. It checks
+enclosing types, enclosing namespaces, and imports at their actual lexical scopes;
+it does not use file co-location, short-name uniqueness, or suffix matching as
+visibility evidence. Namespace imports expose types, not child namespaces.
+`global::` qualifications and simple namespace/type aliases retain their meaning.
+This follows the lookup order in the C# specification's
+[namespace and type names](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/basic-concepts#78-namespace-and-type-names)
+and [using directives](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/namespaces#146-using-directives).
+
+Explicit global usings are collected across files owned by the nearest single
+`.csproj`, rather than across all projects in the repository. With multiple project
+files in that directory, ownership is unknown and global usings stay local to their
+file. Loose C# files without a project share the review root as one compilation.
+This is a structural approximation: linked/conditional compile items, generated or
+implicit usings, project references and target frameworks require MSBuild evaluation.
+Rebuild after changing project layout when updates are driven only by source watches.
+
+Every C# call keeps `csharp_raw_target` and receiver evidence after binding. Resolved
+edges are marked `INFERRED`; unresolved edges retain `unresolved_targets` so generic
+graph fallbacks cannot bind them using weaker evidence. Each C# update re-evaluates
+these calls, including unchanged callers. `TESTED_BY` mirrors move with their calls.
+Before deleting a callee file, incoming managed calls return to their raw references
+so recreating a declaration can resolve them again.
+
+`CSHARP_IDENTITY_VERSION = "2"` upgrades both the old namespace-free format and the
+nested-type-only format proposed in #937. Incremental updates reparse existing C#
+files despite matching hashes. The attempted version is recorded together with
+failed file paths; subsequent updates retry those files alone and preserve their
+last stored data until parsing succeeds. This avoids extending #944's repeated
+full-rebuild loop. No SQL migration attempts to reconstruct missing source identity.
+
+This remains a structural graph, not a C# compiler. Overload selection, generic
+arity/type substitution (#943), inherited members, assembly accessibility, and
+unqualified calls imported with `using static` are outside this change. Constructed
+receiver spellings are retained rather than erased to another declaration; unsupported
+or ambiguous bindings stay unresolved. Inheritance target spelling is unchanged.
+
 ## Parsing Strategy
 
 Tree-sitter provides language-agnostic AST access. The parser:
