@@ -475,8 +475,9 @@ def incremental_trace_flows(
     Returns the number of re-traced flows that were stored.
     """
     if store.get_metadata("csharp_flows_dirty") == "1":
-        # ponytail: C# rebinding can change unchanged callers and entry points;
-        # use a full retrace until the binder supplies a complete affected set.
+        # C# rebinding can change callers and entry points in files that were
+        # never reparsed, so a changed-file set cannot bound the work. Retrace
+        # in full until the binder reports a complete affected set.
         return store_flows(store, trace_flows(store, max_depth=max_depth))
     if not changed_files:
         return 0

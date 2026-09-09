@@ -53,8 +53,9 @@ def resolve_csharp_calls(store: GraphStore, repo_root: Path | None = None) -> di
         if projects:
             return str(projects[0]) if len(projects) == 1 else None
         if directory == root or directory.parent == directory:
-            # ponytail: loose .cs files share the review root; MSBuild compile
-            # item evaluation is needed for linked/conditional source ownership.
+            # Loose .cs files share the review root. Resolving linked or
+            # conditional source ownership properly needs MSBuild compile-item
+            # evaluation, which is outside this pass.
             return str(root)
         return project(directory.parent)
 
