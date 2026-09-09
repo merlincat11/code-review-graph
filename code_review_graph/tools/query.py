@@ -604,8 +604,10 @@ def query_graph(
             # (e.g. "Animal") while qn is fully qualified
             # (e.g. "sample.dart::Animal"). Search by plain name too. See: #87
             if total_results == 0 and node:
-                # ponytail: indexed-name ambiguity only; binding belongs in #943.
-                # File namespaces/imports cannot prove which declaration a base names.
+                # Ambiguity is measured on the indexed name alone: several
+                # declarations answer to this bare base name. Which one it
+                # binds to is #943's work — file namespaces and imports cannot
+                # prove it — so caveat the matches instead of guessing.
                 languages = (
                     _compatible_edge_languages(node.language) if node.language else (None,)
                 )
