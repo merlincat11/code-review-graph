@@ -116,103 +116,6 @@ def _rank_disambiguation_candidates(
     return [node_to_dict(node) for node in sorted(candidates, key=score)]
 
 
-def _declared_namespaces(store: GraphStore, file_path: str) -> set[str]:
-    """Return the namespaces a file declares, when the parser records them."""
-    file_node = store.get_node(file_path) if file_path else None
-    extra = getattr(file_node, "extra", None)
-    declared = extra.get("csharp_namespaces") if isinstance(extra, dict) else None
-    if not isinstance(declared, list):
-        return set()
-    return {namespace for namespace in declared if isinstance(namespace, str)}
-
-
-def _namespace_scope(namespaces: set[str]) -> set[str]:
-    """Return *namespaces* plus the enclosing namespaces they can see into.
-
-    A declaration in ``A.Sub`` names a type in ``A`` without a using
-    directive, so lookup has to walk outwards. The reverse does not hold:
-    ``A`` cannot see ``A.Sub`` unqualified.
-    """
-    scope = set()
-    for namespace in namespaces:
-        while namespace:
-            scope.add(namespace)
-            namespace = namespace.rpartition(".")[0]
-    return scope
-
-
-def _declaration_visibility(
-    store: GraphStore, node: GraphNode, child: GraphNode, declared: set[str],
-) -> str:
-    """Return whether *child* can name the declaration in *node*.
-
-    ``"visible"`` on evidence, never proximity: the same file, an import of
-    the declaring file, or — for C#, whose ``using`` imports a namespace
-    rather than a file — a namespace the declaring file declares.
-
-    ``"hidden"`` only when both files name a namespace and they disagree,
-    which is positive evidence that this declaration is out of reach.
-    Everything else is ``"unknown"``: absent evidence is not counter-evidence,
-    and a language whose packages the graph does not record must not have its
-    correct answers deleted on that silence.
-    """
-    if not node.file_path or not child.file_path:
-        return "unknown"
-    if node.file_path == child.file_path:
-        return "visible"
-    imported = {
-        edge.target_qualified
-        for edge in store.iter_edges_by_source(child.file_path)
-        if edge.kind == "IMPORTS_FROM"
-    }
-    if node.file_path in imported:
-        return "visible"
-    if not declared:
-        return "unknown"
-    child_namespaces = _declared_namespaces(store, child.file_path)
-    if declared & (imported | _namespace_scope(child_namespaces)):
-        return "visible"
-    return "hidden" if child_namespaces else "unknown"
-
-
-def _resolve_bare_inheritors(
-    store: GraphStore, node: GraphNode, candidates: list[tuple[GraphNode, Any]],
-) -> list[tuple[GraphNode, Any, bool]]:
-    """Attach identity to bare-name inheritor matches. See: #940.
-
-    ``INHERITS``/``IMPLEMENTS`` targets are bare base names, so the fallback
-    that matches them by name cannot tell two same-named declarations apart
-    and would report a class from another namespace as an inheritor without
-    any caveat. One declaration of the name is unambiguous and stays exactly
-    as before; several means each match is judged on its own visibility. A
-    match the graph cannot place is kept and flagged as inferred from the bare
-    name — dropping it would delete the correct answer whenever a sibling
-    happens to carry stronger evidence.
-
-    Returns ``(child, edge, inferred)`` triples.
-    """
-    languages = _compatible_edge_languages(node.language) if node.language else (None,)
-    declarations = sum(
-        store.count_nodes_by_name(node.name, language=language, kinds=("Class", "Type"))
-        for language in languages
-    )
-    if declarations <= 1:
-        return [(child, edge, False) for child, edge in candidates]
-    declared = _declared_namespaces(store, node.file_path)
-    # Visibility depends only on the child's file, and one file commonly holds
-    # several inheritors, so each file is placed once per query.
-    by_file: dict[str, str] = {}
-    resolved = []
-    for child, edge in candidates:
-        visibility = by_file.get(child.file_path)
-        if visibility is None:
-            visibility = _declaration_visibility(store, node, child, declared)
-            by_file[child.file_path] = visibility
-        if visibility != "hidden":
-            resolved.append((child, edge, visibility == "unknown"))
-    return resolved
-
-
 def get_impact_radius(
     changed_files: list[str] | None = None,
     max_depth: int = 2,
@@ -701,21 +604,25 @@ def query_graph(
             # (e.g. "Animal") while qn is fully qualified
             # (e.g. "sample.dart::Animal"). Search by plain name too. See: #87
             if total_results == 0 and node:
-                bare_matches: list[tuple[GraphNode, Any]] = []
+                # ponytail: indexed-name ambiguity only; binding belongs in #943.
+                # File namespaces/imports cannot prove which declaration a base names.
+                languages = (
+                    _compatible_edge_languages(node.language) if node.language else (None,)
+                )
+                ambiguous_base = sum(
+                    store.count_nodes_by_name(node.name, language=language, kinds=("Class", "Type"))
+                    for language in languages
+                ) > 1
                 for kind in ("INHERITS", "IMPLEMENTS"):
                     for e in store.iter_edges_by_target_name(
                         node.name, kind=kind, language=node.language or None,
                     ):
                         child = store.get_node(e.source_qualified)
                         if child:
-                            bare_matches.append((child, e))
-                for child, e, inferred in _resolve_bare_inheritors(
-                    store, node, bare_matches,
-                ):
-                    child_result = node_to_dict(child)
-                    if inferred:
-                        child_result["inferred_by"] = "bare_name"
-                    add_result(child_result, e)
+                            child_result = node_to_dict(child)
+                            if ambiguous_base:
+                                child_result["inferred_by"] = "bare_name"
+                            add_result(child_result, e)
 
         elif pattern == "triggers_of":
             for edge in store.get_edges_by_source(qn):
@@ -806,10 +713,13 @@ def query_graph(
         )
 
         if detail_level == "minimal":
+            result_fields: tuple[str, ...] = ("name", "kind", "file_path", "indirect")
+            if pattern == "inheritors_of":
+                result_fields += ("inferred_by",)
             minimal_results = [
                 {
                     k: r[k]
-                    for k in ("name", "kind", "file_path", "indirect")
+                    for k in result_fields
                     if k in r
                 }
                 for r in results

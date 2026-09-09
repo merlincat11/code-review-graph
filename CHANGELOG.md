@@ -4,19 +4,13 @@
 
 ### Fixed
 
-- `inheritors_of` no longer reports a same-named class from another namespace
-  as an inheritor. `INHERITS`/`IMPLEMENTS` targets are bare base names, so the
-  fallback that matches them by name could not tell two declarations of
-  `PlainBase` apart and asserted the wrong one with no caveat. A name carried
-  by exactly one declaration is unambiguous and behaves as before; where
-  several share it, each match is judged on its own visibility — the same
-  file, an import of the declaring file, or a namespace that file declares,
-  walking outwards so a class in `A.Sub` still sees a base in `A`. A
-  match is excluded only when both files name a namespace and they disagree.
-  One the graph cannot place — Java package declarations are not stored — is
-  still returned rather than dropped, marked `inferred_by: "bare_name"`, so
-  nothing is asserted that was not established and no correct answer
-  disappears because a sibling carried stronger evidence (#940).
+- `inheritors_of` marks bare-name fallback candidates with
+  `inferred_by: "bare_name"` when multiple indexed `Class`/`Type` declarations
+  share the name within the compatible language family. The marker survives
+  both standard and minimal output. Candidates are streamed with existing
+  result limits and counts. This mitigates #940 without resolving namespace,
+  package, or import binding; ambiguous candidates are retained for verification.
+  Exact-target matches and the existing single-declaration fallback are unchanged.
 
 ## [2.3.8] - 2026-08-21
 

@@ -430,7 +430,8 @@ class TestQueryGraphCallTargetFallbacks:
         assert "tsxCaller" in names
         assert "apexCaller" not in names
 
-    def test_inheritors_of_bare_fallback_uses_js_family_without_apex(self):
+    @pytest.mark.parametrize("ambiguous", [False, True])
+    def test_inheritors_of_bare_fallback_uses_js_family_without_apex(self, ambiguous):
         """Bare INHERITS/IMPLEMENTS edges stay inside the JS language family."""
         base_file = (self.root / "base.js").as_posix()
         ts_file = (self.root / "child.ts").as_posix()
@@ -440,6 +441,15 @@ class TestQueryGraphCallTargetFallbacks:
             store.upsert_node(NodeInfo(
                 kind="Class", name="BaseWidget", file_path=base_file,
                 line_start=1, line_end=8, language="javascript",
+            ))
+            # Only a compatible type declaration should cause an ambiguity marker.
+            store.upsert_node(NodeInfo(
+                kind="Class", name="BaseWidget", file_path=apex_file,
+                line_start=1, line_end=8, language="apex",
+            ))
+            store.upsert_node(NodeInfo(
+                kind="Type" if ambiguous else "Function", name="BaseWidget", file_path=ts_file,
+                line_start=1, line_end=8, language="typescript",
             ))
             store.upsert_node(NodeInfo(
                 kind="Class", name="TsChild", file_path=ts_file,
@@ -487,6 +497,10 @@ class TestQueryGraphCallTargetFallbacks:
             "TsChild",
             "JsxImplementer",
         }
+        assert all(
+            item.get("inferred_by") == ("bare_name" if ambiguous else None)
+            for item in result["results"]
+        )
 
     def test_inheritors_of_bare_dart_class_ignores_member_matches(
         self,
@@ -519,6 +533,7 @@ class TestQueryGraphCallTargetFallbacks:
 
         assert result["status"] == "ok"
         assert {item["name"] for item in result["results"]} == {"Dog"}
+        assert all("inferred_by" not in item for item in result["results"])
 
     @staticmethod
     def _build_repo(tmp_path, monkeypatch, files):
@@ -529,150 +544,200 @@ class TestQueryGraphCallTargetFallbacks:
         (tmp_path / ".code-review-graph").mkdir()
         monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
         with GraphStore(tmp_path / ".code-review-graph" / "graph.db") as store:
-            full_build(tmp_path, store)
+            assert full_build(tmp_path, store)["errors"] == []
 
-    def test_inheritors_of_excludes_same_named_base_in_another_namespace(
-        self, tmp_path, monkeypatch,
+    @pytest.mark.parametrize(
+        "base_source,other_source,child_source,extra_files",
+        [
+            pytest.param(
+                "namespace A; public class PlainBase {}",
+                "namespace B; public class PlainBase {}",
+                "namespace B; public class Child : PlainBase {}",
+                {}, id="different-namespace",
+            ),
+            pytest.param(
+                "namespace A; public class PlainBase {}",
+                "namespace B; public class PlainBase {}",
+                "namespace C; using A; public class Child : PlainBase {}",
+                {}, id="ordinary-using",
+            ),
+            pytest.param(
+                "namespace A; public class PlainBase {}",
+                "namespace B; public class PlainBase {}",
+                "namespace C; public class Child : PlainBase {}",
+                {"Usings.cs": "global using A;"}, id="global-using",
+            ),
+            pytest.param(
+                "namespace A; public class PlainBase {}",
+                "namespace B; public class PlainBase {}",
+                "using PlainBase = A.PlainBase; namespace C; "
+                "public class Child : PlainBase {}",
+                {}, id="type-alias",
+            ),
+            pytest.param(
+                "namespace A.Models; public class PlainBase {}",
+                "namespace B; public class PlainBase {}",
+                "namespace A.C { using Models; public class Child : PlainBase {} }",
+                {}, id="relative-using",
+            ),
+            pytest.param(
+                "public class PlainBase {} namespace Unrelated { class Marker {} }",
+                "namespace B; public class PlainBase {}",
+                "namespace C; public class Child : PlainBase {}",
+                {}, id="global-base-with-unrelated-namespace",
+            ),
+            pytest.param(
+                "namespace A; public class PlainBase {}",
+                "namespace B; public class PlainBase {}",
+                "namespace A.Sub; public class Child : PlainBase {}",
+                {}, id="enclosing-namespace",
+            ),
+            pytest.param(
+                "namespace A; public class PlainBase {}",
+                "namespace A.Sub; public class PlainBase {}",
+                "namespace A.Sub; public class Child : PlainBase {}",
+                {}, id="nearer-base-shadows-outer-base",
+            ),
+            pytest.param(
+                "namespace A; public class PlainBase {}",
+                "namespace B; public class PlainBase {}",
+                "namespace A { class Marker {} } "
+                "namespace B { public class Child : PlainBase {} }",
+                {}, id="unrelated-namespace-in-child-file",
+            ),
+            pytest.param(
+                "namespace A { public class PlainBase {} } "
+                "namespace B { public class Child : PlainBase {} }",
+                "namespace B; public class PlainBase {}",
+                "", {}, id="same-file-does-not-prove-binding",
+            ),
+        ],
+    )
+    def test_inheritors_of_caveats_ambiguous_bases_without_guessing_visibility(
+        self, tmp_path, monkeypatch, base_source, other_source, child_source, extra_files,
     ):
-        """Issue #940: a bare base name must not cross a namespace boundary."""
+        """#940: file namespaces/imports prove neither binding nor absence."""
         self._build_repo(tmp_path, monkeypatch, {
-            "A/Base.cs": "namespace A;\npublic class PlainBase { }\n",
-            "A/Child.cs": "namespace A;\npublic class Sub : PlainBase { }\n",
-            "B/Base.cs": "namespace B;\npublic class PlainBase { }\n",
-            "B/Child.cs": "namespace B;\npublic class FarSub : PlainBase { }\n",
+            "Base.cs": base_source,
+            "Other.cs": other_source,
+            "Child.cs": child_source,
+            **extra_files,
         })
+        for detail_level in ("standard", "minimal"):
+            result = query_graph(
+                "inheritors_of", f"{(tmp_path / 'Base.cs').as_posix()}::PlainBase",
+                str(tmp_path), detail_level=detail_level,
+            )
+            assert result["status"] == "ok"
+            assert result["result_count"] == 1
+            assert result["results_omitted"] == 0
+            assert {item["name"]: item.get("inferred_by") for item in result["results"]} == {
+                "Child": "bare_name",
+            }
 
-        result = query_graph(
-            pattern="inheritors_of",
-            target=f"{(tmp_path / 'A' / 'Base.cs').as_posix()}::PlainBase",
-            repo_root=str(tmp_path),
-        )
-
-        assert result["status"] == "ok"
-        assert {item["name"] for item in result["results"]} == {"Sub"}
-        # Namespace evidence resolved it, so the match is asserted, not hedged.
-        assert all("inferred_by" not in item for item in result["results"])
-
-    def test_inheritors_of_uses_a_using_directive_as_namespace_evidence(
-        self, tmp_path, monkeypatch,
+    @pytest.mark.parametrize("with_import", [False, True])
+    def test_inheritors_of_caveats_java_package_matches_even_with_an_import(
+        self, tmp_path, monkeypatch, with_import,
     ):
-        """A child in a third namespace is visible through its own using."""
+        """Retain both candidates; an imported file does not prove type binding."""
         self._build_repo(tmp_path, monkeypatch, {
-            "A/Base.cs": "namespace A;\npublic class PlainBase { }\n",
-            "B/Base.cs": "namespace B;\npublic class PlainBase { }\n",
-            "C/Child.cs": (
-                "namespace C;\nusing A;\npublic class Imported : PlainBase { }\n"
+            "ja/JBase.java": "package ja; public class JBase {}",
+            "ja/JSub.java": "package ja; public class JSub extends JBase {}",
+            "jb/JBase.java": "package jb; public class JBase {}",
+            "jc/Child.java": (
+                "package jc; " + ("import ja.JBase; " if with_import else "import jb.JBase; ")
+                + "public class Child extends JBase {}"
             ),
         })
+        for detail_level in ("standard", "minimal"):
+            result = query_graph(
+                "inheritors_of", f"{(tmp_path / 'ja' / 'JBase.java').as_posix()}::JBase",
+                str(tmp_path), detail_level=detail_level,
+            )
+            assert {item["name"]: item.get("inferred_by") for item in result["results"]} == {
+                "JSub": "bare_name", "Child": "bare_name",
+            }
 
-        result = query_graph(
-            pattern="inheritors_of",
-            target=f"{(tmp_path / 'A' / 'Base.cs').as_posix()}::PlainBase",
-            repo_root=str(tmp_path),
-        )
-
-        assert {item["name"] for item in result["results"]} == {"Imported"}
-
-    def test_inheritors_of_sees_an_enclosing_namespace_declaration(
-        self, tmp_path, monkeypatch,
+    @pytest.mark.parametrize("ambiguous", [False, True])
+    def test_inheritors_of_streams_bare_matches_and_keeps_counts(
+        self, monkeypatch, ambiguous,
     ):
-        """A class in A.Sub names a type in A without a using directive."""
-        self._build_repo(tmp_path, monkeypatch, {
-            "A/Base.cs": "namespace A;\npublic class PlainBase { }\n",
-            "A/Sub/Child.cs": (
-                "namespace A.Sub;\npublic class Nested : PlainBase { }\n"
-            ),
-            "B/Base.cs": "namespace B;\npublic class PlainBase { }\n",
-        })
+        """The result cap must also bound live edges, for either declaration count."""
+        import weakref
 
-        result = query_graph(
-            pattern="inheritors_of",
-            target=f"{(tmp_path / 'A' / 'Base.cs').as_posix()}::PlainBase",
-            repo_root=str(tmp_path),
-        )
+        with GraphStore(self.db_path) as store:
+            for name in ("Base", "Other.Base") if ambiguous else ("Base",):
+                store.upsert_node(NodeInfo(
+                    kind="Class", name="Base", file_path=self.target_file,
+                    parent_name="Other" if name == "Other.Base" else None,
+                    language="objc", line_start=1, line_end=2,
+                ))
+            for index in range(6):
+                name = f"Child{index}"
+                store.upsert_node(NodeInfo(
+                    kind="Class", name=name, file_path=self.cross_file,
+                    language="objc", line_start=1, line_end=2,
+                ))
+                store.upsert_edge(EdgeInfo(
+                    kind="INHERITS" if index < 3 else "IMPLEMENTS",
+                    source=f"{self.cross_file}::{name}", target="Base",
+                    file_path=self.cross_file, line=1,
+                ))
+            store.commit()
 
-        assert {item["name"] for item in result["results"]} == {"Nested"}
-        assert all("inferred_by" not in item for item in result["results"])
+        original = GraphStore.iter_edges_by_target_name
 
-    def test_inheritors_of_does_not_look_into_a_nested_namespace(
-        self, tmp_path, monkeypatch,
+        def bounded_edges(store, *args, **kwargs):
+            previous = None
+            for edge in original(store, *args, **kwargs):
+                yield edge
+                # The consumer may hold the current edge, but must release its predecessor.
+                if previous is not None:
+                    assert previous() is None, "bare matches are being retained"
+                previous = weakref.ref(edge)
+
+        monkeypatch.setattr(GraphStore, "iter_edges_by_target_name", bounded_edges)
+        for detail_level in ("standard", "minimal"):
+            result = query_graph(
+                "inheritors_of", f"{self.target_file}::Base", str(self.root),
+                detail_level=detail_level, max_results=1,
+            )
+            assert result["result_count"] == 6
+            assert result["results_omitted"] == 5
+            assert len(result["results"]) == 1
+            assert result["results"][0].get("inferred_by") == (
+                "bare_name" if ambiguous else None
+            )
+            if detail_level == "standard":
+                assert len(result["edges"]) == 1
+                assert result["edges"][0]["source"] == result["results"][0]["qualified_name"]
+
+    @pytest.mark.parametrize("resolved", [False, True])
+    def test_inheritors_of_preserves_exact_and_single_declaration_matches(
+        self, tmp_path, monkeypatch, resolved,
     ):
-        """The walk is outwards only: A cannot name A.Sub.PlainBase bare."""
-        self._build_repo(tmp_path, monkeypatch, {
-            "A/Sub/Base.cs": "namespace A.Sub;\npublic class PlainBase { }\n",
-            "A/Child.cs": "namespace A;\npublic class Outer : PlainBase { }\n",
-            "B/Base.cs": "namespace B;\npublic class PlainBase { }\n",
-        })
-
-        result = query_graph(
-            pattern="inheritors_of",
-            target=f"{(tmp_path / 'A' / 'Sub' / 'Base.cs').as_posix()}::PlainBase",
-            repo_root=str(tmp_path),
-        )
-
-        assert result["results"] == []
-
-    def test_inheritors_of_marks_bare_matches_when_identity_is_unavailable(
-        self, tmp_path, monkeypatch,
-    ):
-        """Java packages are not stored, so ambiguous matches stay unasserted."""
-        self._build_repo(tmp_path, monkeypatch, {
-            "ja/JBase.java": "package ja;\npublic class JBase {}\n",
-            "ja/JSub.java": "package ja;\npublic class JSub extends JBase {}\n",
-            "jb/JBase.java": "package jb;\npublic class JBase {}\n",
-            "jb/JFar.java": "package jb;\npublic class JFar extends JBase {}\n",
-        })
-
-        result = query_graph(
-            pattern="inheritors_of",
-            target=f"{(tmp_path / 'ja' / 'JBase.java').as_posix()}::JBase",
-            repo_root=str(tmp_path),
-        )
-
-        # Dropping them would lose the correct same-package answer, so they are
-        # returned; every one is flagged because none of them is established.
-        assert {item["name"] for item in result["results"]} == {"JSub", "JFar"}
-        assert all(
-            item["inferred_by"] == "bare_name" for item in result["results"]
-        )
-
-    def test_inheritors_of_keeps_an_unplaceable_sibling_of_an_evidenced_match(
-        self, tmp_path, monkeypatch,
-    ):
-        """Stronger evidence on one match must not delete an unplaceable one."""
-        self._build_repo(tmp_path, monkeypatch, {
-            "ja/JBase.java": "package ja;\npublic class JBase {}\n",
-            "ja/SamePkg.java": "package ja;\npublic class SamePkg extends JBase {}\n",
-            "jb/JBase.java": "package jb;\npublic class JBase {}\n",
-            "jc/Importer.java": (
-                "package jc;\nimport ja.JBase;\n"
-                "public class Importer extends JBase {}\n"
-            ),
-        })
-
-        result = query_graph(
-            pattern="inheritors_of",
-            target=f"{(tmp_path / 'ja' / 'JBase.java').as_posix()}::JBase",
-            repo_root=str(tmp_path),
-        )
-
-        placed = {item["name"]: item.get("inferred_by") for item in result["results"]}
-        # SamePkg is the correct answer and the graph cannot prove it; Importer
-        # is proven by its import. Judging per match keeps both.
-        assert placed == {"SamePkg": "bare_name", "Importer": None}
-
-    def test_inheritors_of_leaves_an_unambiguous_bare_match_asserted(
-        self, tmp_path, monkeypatch,
-    ):
-        """One declaration of the name needs no evidence and gains no caveat."""
+        """The mitigation changes only ambiguous bare-name fallback responses."""
         self._build_repo(tmp_path, monkeypatch, {
             "Solo.java": "public class Solo {}\n",
             "SoloChild.java": "public class SoloChild extends Solo {}\n",
         })
+        target = f"{(tmp_path / 'Solo.java').as_posix()}::Solo"
+        if resolved:
+            with GraphStore(tmp_path / ".code-review-graph" / "graph.db") as store:
+                store.upsert_node(NodeInfo(
+                    kind="Class", name="Solo", file_path=(tmp_path / "Other.java").as_posix(),
+                    language="java", line_start=1, line_end=1,
+                ))
+                store.upsert_edge(EdgeInfo(
+                    kind="INHERITS",
+                    source=f"{(tmp_path / 'SoloChild.java').as_posix()}::SoloChild",
+                    target=target, file_path=(tmp_path / "SoloChild.java").as_posix(), line=1,
+                ))
+                store.commit()
 
         result = query_graph(
             pattern="inheritors_of",
-            target=f"{(tmp_path / 'Solo.java').as_posix()}::Solo",
+            target=target,
             repo_root=str(tmp_path),
         )
 
