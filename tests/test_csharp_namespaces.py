@@ -123,6 +123,59 @@ def _calls(store: GraphStore, caller: str):
         "class C { void Go() { Alias.Service.Run(); } } }",
         "Consumer.C.Go", "A.B.Service.Run",
     ),
+    (
+        "using Alias = App; namespace App { class Service { public static void Run() {} } } "
+        "class C { void Go() { Alias::Service.Run(); } }",
+        "C.Go", "App.Service.Run",
+    ),
+    (
+        "namespace App { class Outer { static void Run() {} "
+        "class Inner { void Go() { Run(); } } } }",
+        "App.Outer.Inner.Go", "App.Outer.Run",
+    ),
+    (
+        "using Alias = App; class Alias {} "
+        "namespace App { class Service { public static void Run() {} } } "
+        "class C { void Go(int Alias) { Alias::Service.Run(); } }",
+        "C.Go", "App.Service.Run",
+    ),
+    (
+        "using Alias = App.Container; namespace App { class Container { "
+        "public class Service { public static void Run() {} } } } "
+        "class C { void Go() { Alias::Service.Run(); } }",
+        "C.Go", None,
+    ),
+    (
+        "namespace App { class Service { public static void Run() {} } } "
+        "namespace N { using Alias = App; class C {} } "
+        "namespace N { class C { void Go() { Alias::Service.Run(); } } }",
+        "N.C.Go", None,
+    ),
+    (
+        "using Alias = App; namespace App { class Service { public void Run() {} } } "
+        "class C { void Go(Alias::Service value) { value.Run(); } }",
+        "C.Go", "App.Service.Run",
+    ),
+    (
+        "namespace App { class Outer { static void Run() {} "
+        "class Inner { void Go() { this.Run(); } } } }",
+        "App.Outer.Inner.Go", None,
+    ),
+    (
+        "namespace App { class Outer { void Run() {} "
+        "class Inner { void Go() { Run(); } } } }",
+        "App.Outer.Inner.Go", None,
+    ),
+    (
+        "namespace App { class Outer { static void Run() {} "
+        "class Inner { void Run() {} void Go() { Run(); } } } }",
+        "App.Outer.Inner.Go", "App.Outer.Inner.Run",
+    ),
+    (
+        "namespace App { class Outer { static void Run() {} "
+        "class Inner { void Go(System.Action Run) { Run(); } } } }",
+        "App.Outer.Inner.Go", None,
+    ),
 ])
 def test_namespace_binding(source, caller, expected, tmp_path):
     with _build(tmp_path, {"Case.cs": source}) as store:
@@ -135,6 +188,23 @@ def test_namespace_binding(source, caller, expected, tmp_path):
         else:
             assert calls[0]["target_qualified"] == extra["csharp_raw_target"]
             assert "unresolved_targets" in extra
+
+
+@pytest.mark.parametrize("declaration", [
+    "System.Action Run; void Go() { Run(); }",
+    "System.Action Run { get; set; } void Go() { Run(); }",
+    "void Go() { System.Action Run = () => {}; Run(); }",
+    "void Go() { void Run() {} Run(); }",
+    "void Go() { Run(); void Run() {} }",
+])
+def test_enclosing_static_lookup_preserves_callable_shadowing(tmp_path, declaration):
+    with _build(tmp_path, {"Case.cs":
+        "namespace App { class Outer { static void Run() {} class Inner { "
+        + declaration + " } } }"
+    }) as store:
+        call, = _calls(store, "App.Outer.Inner.Go")
+        assert call["target_qualified"] == "Run"
+        assert "unresolved_targets" in json.loads(call["extra"])
 
 
 def test_same_file_identities_and_same_line_calls_survive_storage(tmp_path):
@@ -258,13 +328,17 @@ def test_using_before_and_after_file_scoped_namespace_has_distinct_lookup(tmp_pa
         assert _calls(store, "App.C.Go")[0]["target_qualified"].endswith(f"::{namespace}.S.Run")
 
 
-def test_partial_type_methods_keep_their_declaring_file(tmp_path):
+@pytest.mark.parametrize("nested", [False, True])
+def test_partial_type_methods_keep_their_declaring_file(tmp_path, nested):
+    declaration = "class Inner { void Go() { Run(); } }" if nested else "void Go() { Run(); }"
+    modifier = "static " if nested else ""
     with _build(tmp_path, {
-        "First.cs": "namespace A; partial class C { void Go() { Run(); } }",
-        "Second.cs": "namespace A; partial class C { public void Run() {} }",
-        "Caller.cs": "using A; class Consumer { void Go(C value) { value.Run(); } }",
+        "First.cs": "namespace A; partial class C { " + declaration + " }",
+        "Second.cs": "namespace A; partial class C { public " + modifier + "void Run() {} }",
+        "Caller.cs": "using A; class Consumer { void Go(C value) { "
+                     + ("C" if nested else "value") + ".Run(); } }",
     }) as store:
-        for caller in ("A.C.Go", "Consumer.Go"):
+        for caller in ("A.C.Inner.Go" if nested else "A.C.Go", "Consumer.Go"):
             assert _calls(store, caller)[0]["target_qualified"] == (
                 f"{tmp_path / 'Second.cs'}::A.C.Run"
             )
@@ -332,6 +406,54 @@ def test_global_usings_are_project_scoped_and_rebound_on_update(tmp_path):
         assert _calls(store, "One.C.Go")[0]["target_qualified"].endswith("::Other.Service.Run")
 
 
+@pytest.mark.parametrize("postprocess", ["full", "minimal", "none"])
+def test_rebinding_refreshes_flows_for_unchanged_callers(tmp_path, postprocess):
+    from code_review_graph.flows import get_flows, store_flows, trace_flows
+    from code_review_graph.tools.build import _run_postprocess, build_or_update_graph
+
+    with _build(tmp_path, {
+        "Imports.cs": "global using S = A.Service;",
+        "Caller.cs": "class Caller { void Go() { S.Run(); } }",
+        "A.cs": "namespace A; class Service { public static void Run() { Finish(); } "
+                "static void Finish() {} }",
+        "B.cs": "namespace B; class Service { public static void Run() { Finish(); } "
+                "static void Finish() {} }",
+    }) as store:
+        store_flows(store, trace_flows(store))
+        assert len(get_flows(store)) == 2
+        for directive in (
+            "global using S = B.Service;", "// removed", "global using S = A.Service;",
+        ):
+            (tmp_path / "Imports.cs").write_text(directive, encoding="utf-8")
+            result = incremental_update(tmp_path, store, changed_files=["Imports.cs"])
+            assert result["files_updated"] == 1
+            if postprocess == "full" and directive == "global using S = B.Service;":
+                previous_flows = get_flows(store)
+                with pytest.raises(KeyError):
+                    # Failed replacement must preserve flows and pending invalidation.
+                    store_flows(store, [{}])
+                assert get_flows(store) == previous_flows
+            _run_postprocess(store, result, postprocess, changed_files=result["changed_files"])
+            if postprocess != "full":
+                # A later full postprocess must consume invalidation even with no source changes.
+                with patch("code_review_graph.incremental.get_changed_files", return_value=[]):
+                    build_or_update_graph(repo_root=str(tmp_path), base="HEAD", postprocess="full")
+            assert {
+                flow["entry_point_id"]: flow["path"] for flow in get_flows(store)
+            } == {
+                flow["entry_point_id"]: flow["path"] for flow in trace_flows(store)
+            }
+
+        (tmp_path / "A.cs").unlink()
+        result = incremental_update(tmp_path, store, changed_files=["A.cs"])
+        _run_postprocess(store, result, "full", changed_files=result["changed_files"])
+        assert {
+            flow["entry_point_id"]: flow["path"] for flow in get_flows(store)
+        } == {
+            flow["entry_point_id"]: flow["path"] for flow in trace_flows(store)
+        }
+
+
 def test_global_using_and_tested_by_survive_repeated_passes(tmp_path):
     with _build(tmp_path, {
         "Imports.cs": "global using Other;",
@@ -353,11 +475,16 @@ def test_global_using_and_tested_by_survive_repeated_passes(tmp_path):
 
 
 @pytest.mark.parametrize("ambiguous_project", [False, True])
-def test_global_alias_requires_known_shared_project_ownership(tmp_path, ambiguous_project):
+@pytest.mark.parametrize("qualified", [False, True])
+def test_global_alias_requires_known_shared_project_ownership(
+    tmp_path, ambiguous_project, qualified,
+):
+    alias_target = "Other" if qualified else "Other.Service"
+    receiver = "Alias::Service" if qualified else "Alias"
     files = {
         "One.csproj": "<Project />",
-        "Imports.cs": "global using Alias = Other.Service;",
-        "Caller.cs": "class C { void Go() { Alias.Run(); } }",
+        "Imports.cs": f"global using Alias = {alias_target};",
+        "Caller.cs": "class C { void Go() { " + receiver + ".Run(); } }",
         "Service.cs": "namespace Other; class Service { public static void Run() {} }",
     }
     if ambiguous_project:
@@ -365,12 +492,12 @@ def test_global_alias_requires_known_shared_project_ownership(tmp_path, ambiguou
     with _build(tmp_path, files) as store:
         target = _calls(store, "C.Go")[0]["target_qualified"]
         if ambiguous_project:
-            assert target == "Alias::Run"
+            assert target == f"{receiver}::Run"
         else:
             assert target.endswith("::Other.Service.Run")
 
 
-@pytest.mark.parametrize("stored_version", ["1", "2"])
+@pytest.mark.parametrize("stored_version", ["1", "2", "3"])
 def test_upgrade_retries_only_failed_files_and_bypasses_unchanged_hash(tmp_path, stored_version):
     with _build(tmp_path, {
         "Good.cs": "namespace Good; class C { static int Run() => 1; static int Value = Run(); }",
@@ -382,6 +509,8 @@ def test_upgrade_retries_only_failed_files_and_bypasses_unchanged_hash(tmp_path,
         for name in ("Good", "Bad"):
             path = tmp_path / f"{name}.cs"
             nodes, edges = CodeParser().parse_file(path)
+            for node in nodes:
+                node.extra.pop("csharp_static", None)
             if stored_version == "1":
                 for node in nodes:
                     node.parent_name = (
@@ -409,7 +538,8 @@ def test_upgrade_retries_only_failed_files_and_bypasses_unchanged_hash(tmp_path,
             upgraded = incremental_update(tmp_path, store, changed_files=[])
             assert upgraded["identity_rebuild"]
             assert set(attempts) == {"Good.cs", "Bad.cs"}
-            assert store.get_node(f"{tmp_path / 'Good.cs'}::Good.C.Run") is not None
+            run = store.get_node(f"{tmp_path / 'Good.cs'}::Good.C.Run")
+            assert run is not None and run.extra["csharp_static"]
             assert store.get_node(f"{tmp_path / 'Good.cs'}::C.Run") is None
             call = store._conn.execute("SELECT * FROM edges WHERE kind = 'CALLS'").fetchone()
             assert call["target_qualified"] == f"{tmp_path / 'Good.cs'}::Good.C.Run"

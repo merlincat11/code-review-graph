@@ -61,6 +61,7 @@ def resolve_csharp_calls(store: GraphStore, repo_root: Path | None = None) -> di
     projects = {f: project(Path(f).parent) for f in files}
     types: dict[str, list[str]] = {}
     methods: dict[tuple[str, str], list[str]] = {}
+    static_methods: set[str] = set()
     parents: dict[str, str] = {}
     partial_types: set[str] = set()
     type_files: dict[str, str] = {}
@@ -85,6 +86,8 @@ def resolve_csharp_calls(store: GraphStore, repo_root: Path | None = None) -> di
         elif node["kind"] in ("Function", "Method", "Test"):
             method_key = (f"{node['file_path']}::{parent}", node["name"])
             methods.setdefault(method_key, []).append(qualified)
+            if extra.get("csharp_static"):
+                static_methods.add(qualified)
 
     imports: dict[tuple[str, int], list[tuple[str, dict]]] = {}
     global_imports: dict[str, list[tuple[str, dict]]] = {}
@@ -130,6 +133,21 @@ def resolve_csharp_calls(store: GraphStore, repo_root: Path | None = None) -> di
         # Nullable receivers use the underlying declaration for member lookup;
         # the original annotation remains in the call's stored evidence.
         raw = raw.removeprefix("global::").removesuffix("?")
+        alias, separator, reference = raw.partition("::")
+        if separator:
+            if not alias.isidentifier() or not all(p.isidentifier() for p in reference.split(".")):
+                return []
+            # Unlike '.', '::' searches only namespace aliases, even when a
+            # local, type, or namespace has the same name as the qualifier.
+            for _, scope in scopes:
+                aliases = [d for d in directives(file, scope) if d[1].get("csharp_alias") == alias]
+                if not aliases:
+                    continue
+                if len(aliases) != 1:
+                    return []
+                target = import_target(*aliases[0])
+                return types.get(_join(target, reference), []) if target in namespaces else []
+            return []
         # Keep generic arguments lossless; erasure could select a different
         # declaration (I vs I<T>). Generic binding belongs to #943.
         if not all(part.isidentifier() for part in raw.split(".")):
@@ -186,7 +204,7 @@ def resolve_csharp_calls(store: GraphStore, repo_root: Path | None = None) -> di
 
     def targets(row, extra: dict) -> list[str]:
         scopes = extra.get("csharp_scopes")
-        if not scopes:
+        if not scopes or extra.get("receiver_resolution") == "shadowed_callable":
             return []
         # Initializers have a File caller but still belong to a lexical type.
         owner = extra.get("csharp_containing_type") or parents.get(
@@ -195,28 +213,34 @@ def resolve_csharp_calls(store: GraphStore, repo_root: Path | None = None) -> di
         kind = extra.get("csharp_call_kind")
         method = extra["csharp_raw_target"].rsplit("::", 1)[-1]
         receiver = extra.get("receiver_scope", "")
-        if extra.get("receiver") == "this" or kind == "unqualified":
-            own_type = f"{row['file_path']}::{owner}"
-            candidates = [own_type] if own_type in parents else []
-            if own_type in partial_types:
-                candidates = [
-                    c for c in types.get(owner, []) if c in partial_types
-                    and projects[type_files[c]] == projects[row["file_path"]]
-                ]
-        else:
-            candidates = type_targets(receiver, owner, scopes, row["file_path"])
-        if not candidates:
-            return []
-        if len(candidates) > 1:
-            owners = {projects[type_files[c]] for c in candidates}
-            if (
-                not all(c in partial_types for c in candidates)
-                or len(owners) != 1 or None in owners
-            ):
-                return []
-        if kind == "constructor":
-            return candidates
-        return [method_qn for c in candidates for method_qn in methods.get((c, method), [])]
+        for enclosing in (_parents(owner) if kind == "unqualified" else (owner,)):
+            if kind == "unqualified" and enclosing == scopes[0][0]:
+                break  # Only containing types, never namespaces or imported static members.
+            if extra.get("receiver") == "this" or kind == "unqualified":
+                own_type = f"{row['file_path']}::{enclosing}"
+                candidates = [own_type] if own_type in parents else []
+                if own_type in partial_types:
+                    candidates = [
+                        c for c in types.get(enclosing, []) if c in partial_types
+                        and projects[type_files[c]] == projects[row["file_path"]]
+                    ]
+            else:
+                candidates = type_targets(receiver, owner, scopes, row["file_path"])
+            if len(candidates) > 1:
+                owners = {projects[type_files[c]] for c in candidates}
+                if (
+                    not all(c in partial_types for c in candidates)
+                    or len(owners) != 1 or None in owners
+                ):
+                    return []
+            if kind == "constructor":
+                return candidates
+            found = [qn for c in candidates for qn in methods.get((c, method), [])]
+            if found:
+                if enclosing != owner and (len(found) != 1 or found[0] not in static_methods):
+                    return []
+                return found
+        return []
 
     resolved = 0
     changed = False
@@ -261,6 +285,12 @@ def _set_call(store: GraphStore, row, target: str, extra: dict) -> bool:
         (target, serialized, tier, row["target_qualified"], row["source_qualified"],
          row["file_path"], row["line"], row["extra"]),
     )
+    if target != row["target_qualified"]:
+        # Persist alongside the edge: callers and entry points outside the
+        # parsed files may change, including when restoring a deleted target.
+        store._conn.execute(
+            "INSERT OR IGNORE INTO metadata (key, value) VALUES ('csharp_flows_dirty', '1')",
+        )
     return True
 
 

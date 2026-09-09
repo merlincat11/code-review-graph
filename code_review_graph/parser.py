@@ -5140,6 +5140,8 @@ class CodeParser:
 
         class_types = set(self._class_types.get(language, []))
         function_types = set(self._function_types.get(language, []))
+        if language == "csharp":
+            function_types.add("local_function_statement")
         call_types = set(self._call_types.get(language, []))
         block_types = {
             "java": {"block"},
@@ -5180,6 +5182,10 @@ class CodeParser:
 
             if node.type in block_types:
                 scoped = dict(bindings)
+                if language == "csharp":
+                    for child in node.named_children:
+                        if child.type == "local_function_statement":
+                            scoped[_csharp_name(child.child_by_field_name("name"))] = ""
                 for child in node.children:
                     walk(child, scoped, class_fields, depth + 1)
                 return
@@ -5201,6 +5207,13 @@ class CodeParser:
                 return
 
             if node.type in call_types:
+                if language == "csharp":
+                    callee = node.child_by_field_name("function")
+                    if callee is not None and callee.type == "identifier":
+                        name = _csharp_name(callee)
+                        if name in bindings:
+                            # A callable local/member hides containing-type methods.
+                            targets[(node.start_byte, "", name)] = ("", "", "shadowed_callable")
                 receiver, method = self._get_member_call_receiver_method(
                     node, language,
                 )
@@ -5451,7 +5464,7 @@ class CodeParser:
                     csharp=True,
                 )
 
-        elif language == "csharp" and node.type == "parameter":
+        elif language == "csharp" and node.type in ("parameter", "property_declaration"):
             self._store_typed_binding(
                 result,
                 node.child_by_field_name("name"),
@@ -5604,7 +5617,10 @@ class CodeParser:
             receiver = edge.extra.get("receiver")
             method = edge.target.rsplit(".", 1)[-1].rsplit("::", 1)[-1]
             position = edge.extra.get("source_offset", -1) if language == "csharp" else edge.line
-            evidence = targets.get((position, receiver, method)) if receiver else None
+            evidence = (
+                targets.get((position, receiver or "", method))
+                if receiver or language == "csharp" else None
+            )
             if edge.kind == "CALLS" and evidence:
                 target, type_name, evidence_kind = evidence
                 extra = dict(edge.extra)
@@ -10535,6 +10551,9 @@ class CodeParser:
         method_extra: dict = {}
         if language == "csharp":
             method_extra["csharp_namespace"] = _csharp_namespace_context(child)[0][0]
+            method_extra["csharp_static"] = any(
+                c.type == "modifier" and c.text == b"static" for c in child.children
+            )
         go_receiver_bindings = None
         if language == "go" and child.type == "method_declaration":
             receiver_name = self._get_go_receiver_name(child)

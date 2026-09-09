@@ -117,6 +117,12 @@ enclosing types, enclosing namespaces, and imports at their actual lexical scope
 it does not use file co-location, short-name uniqueness, or suffix matching as
 visibility evidence. Namespace imports expose types, not child namespaces.
 `global::` qualifications and simple namespace/type aliases retain their meaning.
+`Alias::Type` searches only namespace aliases in the call's lexical scopes; it
+does not select a same-named type, namespace, or local. Unqualified calls can reach
+static methods in enclosing types, using parsed `csharp_static` evidence. Lookup
+stops at a nearer method group; `this.Run()` stays within the immediate type.
+Unqualified calls hidden by recorded local, parameter, field or property bindings
+stay unresolved.
 This follows the lookup order in the C# specification's
 [namespace and type names](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/basic-concepts#78-namespace-and-type-names)
 and [using directives](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/namespaces#146-using-directives).
@@ -135,10 +141,17 @@ graph fallbacks cannot bind them using weaker evidence. Each C# update re-evalua
 these calls, including unchanged callers. `TESTED_BY` mirrors move with their calls.
 Before deleting a callee file, incoming managed calls return to their raw references
 so recreating a declaration can resolve them again.
+Binding changes persist a `csharp_flows_dirty` marker with the edge update.
+The next full postprocess retraces all flows, including unchanged callers and
+old/new entry points. Deferred postprocessing retains the marker even if a later
+update parses no files; successful full flow replacement clears it atomically.
+This reuses the existing full trace until the binder can provide a complete
+affected set for incremental tracing.
 
-`CSHARP_IDENTITY_VERSION = "3"` upgrades the old namespace-free format, the
+`CSHARP_IDENTITY_VERSION = "4"` upgrades the old namespace-free format, the
 nested-type-only format proposed in #937, and graphs lacking per-call lexical
-context. Incremental updates reparse existing C# files despite matching hashes.
+context or static/callable evidence. Incremental updates reparse existing C# files
+despite matching hashes.
 The attempted version is recorded together with
 failed file paths; subsequent updates retry those files alone and preserve their
 last stored data until parsing succeeds. This avoids extending #944's repeated
