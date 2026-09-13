@@ -36,6 +36,69 @@ def _join(parent: str, name: str) -> str:
     return f"{parent}.{name}" if parent else name
 
 
+_CLOSING = {"<": ">", "(": ")", "[": "]"}
+
+
+def _split(text: str, separator: str) -> list[str] | None:
+    """Split on *separator* at nesting depth zero, or ``None`` if unbalanced."""
+    parts: list[str] = []
+    depth: list[str] = []
+    current = ""
+    for character in text:
+        if character in _CLOSING:
+            depth.append(_CLOSING[character])
+        elif depth and character == depth[-1]:
+            depth.pop()
+        elif character == separator and not depth:
+            parts.append(current)
+            current = ""
+            continue
+        current += character
+    if depth:
+        return None
+    parts.append(current)
+    return parts
+
+
+def _arity(arguments: str) -> int | None:
+    """Return how many type arguments *arguments* supplies, ``<`` excluded."""
+    if not arguments.endswith(">"):
+        return None
+    supplied = _split(arguments[:-1], ",")
+    if supplied is None or not all(argument.strip() for argument in supplied):
+        return None
+    return len(supplied)
+
+
+def _type_key(reference: str) -> str | None:
+    """Return the declaration key a type reference names, or ``None``.
+
+    Generic declarations are keyed by arity — ``App.Box`1`` — because that is
+    what distinguishes ``Box`` from ``Box<T>``. Erasing the arguments instead
+    would let a reference select a declaration it does not name.
+    """
+    segments = _split(reference, ".")
+    if segments is None:
+        return None
+    keys = []
+    for index, segment in enumerate(segments):
+        name, separator, arguments = segment.partition("<")
+        if not separator:
+            if not segment.isidentifier():
+                return None
+            keys.append(segment)
+            continue
+        # A constructed containing type carries its own arity, which one key
+        # cannot describe; ``Outer<T>.Inner`` stays unresolved.
+        if index != len(segments) - 1 or not name.isidentifier():
+            return None
+        arity = _arity(arguments)
+        if arity is None:
+            return None
+        keys.append(f"{name}`{arity}")
+    return ".".join(keys)
+
+
 def resolve_csharp_calls(store: GraphStore, repo_root: Path | None = None) -> dict:
     conn = store._conn
     nodes = conn.execute("SELECT * FROM nodes WHERE language = 'csharp'").fetchall()
@@ -79,8 +142,12 @@ def resolve_csharp_calls(store: GraphStore, repo_root: Path | None = None) -> di
         qualified = node["qualified_name"]
         parent = node["parent_name"] or ""
         parents[qualified] = parent
-        if node["kind"] == "Class" and not extra.get("csharp_generic"):
-            types.setdefault(_join(parent, node["name"]), []).append(qualified)
+        if node["kind"] == "Class":
+            arity = extra.get("csharp_arity")
+            name = node["name"]
+            if isinstance(arity, int) and arity > 0:
+                name = f"{name}`{arity}"
+            types.setdefault(_join(parent, name), []).append(qualified)
             type_files[qualified] = node["file_path"]
             if extra.get("csharp_partial"):
                 partial_types.add(qualified)
@@ -136,7 +203,8 @@ def resolve_csharp_calls(store: GraphStore, repo_root: Path | None = None) -> di
         raw = raw.removeprefix("global::").removesuffix("?")
         alias, separator, reference = raw.partition("::")
         if separator:
-            if not alias.isidentifier() or not all(p.isidentifier() for p in reference.split(".")):
+            reference_key = _type_key(reference)
+            if not alias.isidentifier() or reference_key is None:
                 return []
             # Unlike '.', '::' searches only namespace aliases, even when a
             # local, type, or namespace has the same name as the qualifier.
@@ -147,12 +215,14 @@ def resolve_csharp_calls(store: GraphStore, repo_root: Path | None = None) -> di
                 if len(aliases) != 1:
                     return []
                 target = import_target(*aliases[0])
-                return types.get(_join(target, reference), []) if target in namespaces else []
+                return types.get(_join(target, reference_key), []) if target in namespaces else []
             return []
-        # Keep generic arguments lossless; erasure could select a different
-        # declaration (I vs I<T>). Generic binding belongs to #943.
-        if not all(part.isidentifier() for part in raw.split(".")):
+        # Generic arguments are kept, not erased: the reference resolves by
+        # arity, so ``I<int>`` reaches ``I<T>`` and never the separate ``I``.
+        key = _type_key(raw)
+        if key is None:
             return []
+        raw = key
         first, _, tail = raw.partition(".")
         if absolute:
             return types.get(raw, [])

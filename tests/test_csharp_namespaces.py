@@ -176,6 +176,31 @@ def _calls(store: GraphStore, caller: str):
         "class Inner { void Go(System.Action Run) { Run(); } } } }",
         "App.Outer.Inner.Go", None,
     ),
+    (
+        "namespace A { class Box<T> { public void Run() {} } "
+        "class C { void Go(Box<int> value) { value.Run(); } } }",
+        "A.C.Go", "A.Box.Run",
+    ),
+    (
+        "namespace A { class Pair<K, V> { public void Run() {} } "
+        "class C { void Go(Pair<string, int> value) { value.Run(); } } }",
+        "A.C.Go", "A.Pair.Run",
+    ),
+    (
+        "namespace A { class Box<T> { public void Run() {} } class C { "
+        "void Go(Box<System.Collections.Generic.List<int>> value) { value.Run(); } } }",
+        "A.C.Go", "A.Box.Run",
+    ),
+    (
+        "namespace A { class Pair<K, V> { public void Run() {} } "
+        "class C { void Go(Pair<int> value) { value.Run(); } } }",
+        "A.C.Go", None,
+    ),
+    (
+        "namespace A { class Outer<T> { public class Inner { public void Run() {} } } "
+        "class C { void Go(Outer<int>.Inner value) { value.Run(); } } }",
+        "A.C.Go", None,
+    ),
 ])
 def test_namespace_binding(source, caller, expected, tmp_path):
     with _build(tmp_path, {"Case.cs": source}) as store:
@@ -273,12 +298,9 @@ def test_nullable_receivers_keep_raw_spelling_and_generic_boundaries(tmp_path, t
             extra = json.loads(call["extra"])
             assert extra["receiver_type"] == type_name
             assert extra["csharp_raw_target"] == f"{type_name}::Run"
-            if "<" in type_name:
-                assert call["target_qualified"] == extra["csharp_raw_target"]
-                assert "unresolved_targets" in extra
-            else:
-                assert call["target_qualified"] == f"{tmp_path / 'Service.cs'}::Other.Service.Run"
-                assert "unresolved_targets" not in extra
+            expected = "Generic.cs" if "<" in type_name else "Service.cs"
+            assert call["target_qualified"] == f"{tmp_path / expected}::Other.Service.Run"
+            assert "unresolved_targets" not in extra
 
 
 @pytest.mark.parametrize("separator", [" ", "\n"])
@@ -351,7 +373,9 @@ def test_generic_reference_is_not_erased_to_a_non_generic_declaration(tmp_path):
         "Caller.cs": "using A; class C { void Go(I<int> value) { value.Run(); } }",
     }) as store:
         call = _calls(store, "C.Go")[0]
-        assert call["target_qualified"] == "I<int>::Run"
+        # Arity selects the declaration the reference names; the separate
+        # non-generic ``I`` stays out of reach, and the spelling is retained.
+        assert call["target_qualified"] == f"{tmp_path / 'Generic.cs'}::A.I.Run"
         assert json.loads(call["extra"])["receiver_scope"] == "I<int>"
 
 
@@ -497,7 +521,7 @@ def test_global_alias_requires_known_shared_project_ownership(
             assert target.endswith("::Other.Service.Run")
 
 
-@pytest.mark.parametrize("stored_version", ["1", "2", "3"])
+@pytest.mark.parametrize("stored_version", ["1", "2", "3", "4"])
 def test_upgrade_retries_only_failed_files_and_bypasses_unchanged_hash(tmp_path, stored_version):
     with _build(tmp_path, {
         "Good.cs": "namespace Good; class C { static int Run() => 1; static int Value = Run(); }",

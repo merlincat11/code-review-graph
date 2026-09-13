@@ -26,6 +26,12 @@
   recreating the declaration binds them again. A binding change marks flows
   dirty and the next full postprocess retraces them, which keeps callers and
   entry points outside the parsed files correct (#946).
+- C# generic declarations are keyed by arity, so a constructed receiver reaches
+  the declaration it names — `I<int>` binds to `I<T>`, `I` binds to the separate
+  `I`, and `Pair<int>` binds to neither when only `Pair<K, V>` is declared. The
+  receiver's spelling is retained on the call and the arity is read from the
+  syntax, so nested arguments and tuples count correctly. Type argument
+  substitution, constraints and overload selection remain out of scope (#946).
 - Existing C# graphs reparse once on the next incremental update to adopt the
   new identities; a file that fails to parse is retried on its own instead of
   holding the version gate open and repeating a full rebuild (#944). Graphs

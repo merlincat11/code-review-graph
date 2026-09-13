@@ -148,20 +148,29 @@ update parses no files; successful full flow replacement clears it atomically.
 This reuses the existing full trace until the binder can provide a complete
 affected set for incremental tracing.
 
-`CSHARP_IDENTITY_VERSION = "4"` upgrades the old namespace-free format, the
+`CSHARP_IDENTITY_VERSION = "5"` upgrades the old namespace-free format, the
 nested-type-only format proposed in #937, and graphs lacking per-call lexical
-context or static/callable evidence. Incremental updates reparse existing C# files
+context, static/callable evidence, or generic arity. Incremental updates reparse existing C# files
 despite matching hashes.
 The attempted version is recorded together with
 failed file paths; subsequent updates retry those files alone and preserve their
 last stored data until parsing succeeds. This avoids extending #944's repeated
 full-rebuild loop. No SQL migration attempts to reconstruct missing source identity.
 
-This remains a structural graph, not a C# compiler. Overload selection, generic
-arity/type substitution (#943), inherited members, assembly accessibility, and
-unqualified calls imported with `using static` are outside this change. Constructed
-receiver spellings are retained rather than erased to another declaration; unsupported
-or ambiguous bindings stay unresolved. Inheritance target spelling is unchanged.
+A generic declaration is keyed by arity — ``App.Box`1`` — so a constructed
+reference reaches the declaration it names and never a same-named one of another
+arity: `I<int>` binds to `I<T>`, `I` binds to `I`, and `Pair<int>` binds to
+neither when only `Pair<K, V>` exists. The receiver's spelling is retained on the
+call; only the key is derived from it, and the key is built from the syntax rather
+than by scanning for angle brackets, so nested arguments and tuples count
+correctly. A constructed containing type such as `Outer<T>.Inner` carries a second
+arity that one key cannot describe, and stays unresolved.
+
+This remains a structural graph, not a C# compiler. Overload selection, type
+argument substitution and constraints (#943), inherited members, assembly
+accessibility, and unqualified calls imported with `using static` are outside this
+change; unsupported or ambiguous bindings stay unresolved. Inheritance target
+spelling is unchanged.
 
 ## Parsing Strategy
 

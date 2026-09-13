@@ -78,7 +78,7 @@ logger = logging.getLogger(__name__)
 
 CPP_IDENTITY_VERSION = "1"
 _CPP_IDENTITY_METADATA_KEY = "cpp_identity_version"
-CSHARP_IDENTITY_VERSION = "4"  # Namespace/call context + static member evidence (#946).
+CSHARP_IDENTITY_VERSION = "5"  # Namespace/call context, static and generic-arity evidence.
 _CSHARP_IDENTITY_METADATA_KEY = "csharp_identity_version"
 _CSHARP_PENDING_METADATA_KEY = "csharp_identity_pending_files"
 

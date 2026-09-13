@@ -10281,8 +10281,15 @@ class CodeParser:
         extra: dict = {}
         if language == "csharp":
             extra["csharp_namespace"] = csharp_namespace
-            if any(c.type == "type_parameter_list" for c in child.children):
-                extra["csharp_generic"] = True
+            parameters = next(
+                (c for c in child.children if c.type == "type_parameter_list"), None,
+            )
+            if parameters is not None:
+                # Arity, not a flag: it is what separates the declarations of
+                # ``I``, ``I<T>`` and ``I<T, U>`` from one another.
+                extra["csharp_arity"] = sum(
+                    1 for c in parameters.named_children if c.type == "type_parameter"
+                )
             if any(c.type == "modifier" and c.text == b"partial" for c in child.children):
                 extra["csharp_partial"] = True
         if language == "swift":
