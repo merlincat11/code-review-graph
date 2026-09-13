@@ -366,6 +366,44 @@ def test_partial_type_methods_keep_their_declaring_file(tmp_path, nested):
             )
 
 
+@pytest.mark.parametrize("parameters", ["<T>", "<T, U>"])
+@pytest.mark.parametrize("split", [False, True])
+def test_generic_partial_lookup_preserves_declaring_arity(tmp_path, parameters, split):
+    method = "public void Run() {}"
+    files = {
+        "First.cs": (
+            f"namespace App; partial class Box{parameters} {{ "
+            "void Go() { Run(); this.Run(); } " + ("" if split else method) + " }"
+        ),
+    }
+    if split:
+        other_parameters = "<T, U>" if parameters == "<T>" else "<T>"
+        files.update({
+            "Second.cs": f"namespace App; partial class Box{parameters} {{ {method} }}",
+            "Plain.cs": f"namespace App; partial class Box {{ {method} }}",
+            "OtherArity.cs": f"namespace App; partial class Box{other_parameters} {{ {method} }}",
+        })
+    with _build(tmp_path, files) as store:
+        calls = _calls(store, "App.Box.Go")
+        expected_file = "Second.cs" if split else "First.cs"
+        assert len(calls) == 2
+        assert all(
+            call["target_qualified"] == f"{tmp_path / expected_file}::App.Box.Run"
+            for call in calls
+        )
+
+
+def test_nested_caller_uses_generic_partial_enclosing_type(tmp_path):
+    with _build(tmp_path, {
+        "First.cs": "namespace App; partial class Box<T> { "
+                    "class Inner { void Go() { Run(); } } }",
+        "Second.cs": "namespace App; partial class Box<T> { public static void Run() {} }",
+        "Plain.cs": "namespace App; partial class Box { public static void Run() {} }",
+    }) as store:
+        call, = _calls(store, "App.Box.Inner.Go")
+        assert call["target_qualified"] == f"{tmp_path / 'Second.cs'}::App.Box.Run"
+
+
 def test_generic_reference_is_not_erased_to_a_non_generic_declaration(tmp_path):
     with _build(tmp_path, {
         "Plain.cs": "namespace A; class I { public void Run() {} }",

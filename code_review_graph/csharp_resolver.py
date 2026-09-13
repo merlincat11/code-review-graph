@@ -127,7 +127,7 @@ def resolve_csharp_calls(store: GraphStore, repo_root: Path | None = None) -> di
     methods: dict[tuple[str, str], list[str]] = {}
     static_methods: set[str] = set()
     parents: dict[str, str] = {}
-    partial_types: set[str] = set()
+    partial_types: dict[str, str] = {}
     type_files: dict[str, str] = {}
     namespaces = {""}
     for node in nodes:
@@ -147,10 +147,11 @@ def resolve_csharp_calls(store: GraphStore, repo_root: Path | None = None) -> di
             name = node["name"]
             if isinstance(arity, int) and arity > 0:
                 name = f"{name}`{arity}"
-            types.setdefault(_join(parent, name), []).append(qualified)
+            type_key = _join(parent, name)
+            types.setdefault(type_key, []).append(qualified)
             type_files[qualified] = node["file_path"]
             if extra.get("csharp_partial"):
-                partial_types.add(qualified)
+                partial_types[qualified] = type_key
         elif node["kind"] in ("Function", "Method", "Test"):
             method_key = (f"{node['file_path']}::{parent}", node["name"])
             methods.setdefault(method_key, []).append(qualified)
@@ -291,8 +292,9 @@ def resolve_csharp_calls(store: GraphStore, repo_root: Path | None = None) -> di
                 own_type = f"{row['file_path']}::{enclosing}"
                 candidates = [own_type] if own_type in parents else []
                 if own_type in partial_types:
+                    # Preserve declaration arity when joining partial definitions.
                     candidates = [
-                        c for c in types.get(enclosing, []) if c in partial_types
+                        c for c in types.get(partial_types[own_type], []) if c in partial_types
                         and projects[type_files[c]] == projects[row["file_path"]]
                     ]
             else:
