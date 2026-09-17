@@ -10,13 +10,14 @@ import logging
 import os
 import re
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
 from .constants import SECURITY_KEYWORDS as _SECURITY_KEYWORDS
 from .flows import get_affected_flows
 from .graph import GraphNode, GraphStore, _sanitize_name, node_to_dict
-from .parser import normalize_file_path
+from .parser import is_test_file, normalize_file_path
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +187,94 @@ _CHURN_SATURATION = 10.0
 _CHURN_WEIGHT = 0.15
 _NUMSTAT_COUNT = re.compile(r"^(?:\d+|-)$")
 
+# ``git log --since --numstat`` now runs inside MCP tool calls, where an
+# agent is blocked on the result, so it gets its own budget rather than the
+# 30-second diff timeout: the history walk is capped at a commit count, and a
+# slow repository degrades to the pre-churn behaviour (an empty mapping, and
+# therefore a zero change-frequency term) instead of hanging the call.
+_CHURN_TIMEOUT = float(os.environ.get("CRG_CHURN_TIMEOUT", "5"))
+_CHURN_MAX_COMMITS = int(os.environ.get("CRG_CHURN_MAX_COMMITS", "2000"))
+
+# Churn counts commits, so the answer only changes when HEAD does: successful
+# results are keyed by (repo, commit, window).
+_CHURN_CACHE_MAX_ENTRIES = 32
+_CHURN_CACHE_LOCK = threading.Lock()
+_CHURN_CACHE: dict[tuple[str, str, int], dict[str, int]] = {}
+
+# Failures cannot be keyed by commit, because the commit is the first thing a
+# slow or broken repository fails to tell us: ``git rev-parse`` runs under the
+# same budget as the walk, so on the repositories the timeout exists for it
+# times out too, and a commit-keyed failure cache never gets a key to store
+# anything under. That is the whole "pays the timeout once" claim gone -- a
+# 5-second rev-parse plus a 5-second walk, on every tool call, for the rest of
+# the session.
+#
+# Churn being unavailable is therefore recorded per (repo, window) for the
+# life of the process, ahead of any git call. It is deliberately sticky: the
+# condition it records is a property of the repository (no Git, no commits, a
+# history too slow to walk inside a tool call), not a transient. Callers that
+# outlive a repository's state -- a long-lived MCP server, a test suite --
+# clear it with ``clear_churn_cache``.
+_CHURN_UNAVAILABLE: set[tuple[str, int]] = set()
+
+# Status values reported alongside the counts, so a degraded review says so
+# rather than quietly scoring the change-frequency term at zero.
+CHURN_OK = "ok"
+CHURN_UNAVAILABLE = "unavailable"
+CHURN_OFF = "off"
+
+
+def clear_churn_cache() -> None:
+    """Drop every memoised churn result, successful and failed alike."""
+    with _CHURN_CACHE_LOCK:
+        _CHURN_CACHE.clear()
+        _CHURN_UNAVAILABLE.clear()
+
+
+def _churn_is_unavailable(fail_key: tuple[str, int]) -> bool:
+    with _CHURN_CACHE_LOCK:
+        return fail_key in _CHURN_UNAVAILABLE
+
+
+def _mark_churn_unavailable(fail_key: tuple[str, int]) -> None:
+    with _CHURN_CACHE_LOCK:
+        if len(_CHURN_UNAVAILABLE) >= _CHURN_CACHE_MAX_ENTRIES:
+            _CHURN_UNAVAILABLE.clear()
+        _CHURN_UNAVAILABLE.add(fail_key)
+    logger.warning(
+        "Change-frequency risk disabled for %s: git history could not be "
+        "read within %.3gs. Risk scores exclude the churn term.",
+        fail_key[0], _CHURN_TIMEOUT,
+    )
+
+
+def _churn_cache_key(repo_root: str, window_days: int) -> tuple[str, str, int] | None:
+    """Identify the commit churn was computed at, or None when unknown.
+
+    An unknown commit (no Git, a repository without commits, a ``rev-parse``
+    that did not answer in time) is not a transient: it is the same condition
+    that stops the walk below from answering, so the caller records churn as
+    unavailable rather than retrying it on every subsequent call.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=repo_root,
+            timeout=_CHURN_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    head = result.stdout.strip()
+    return (repo_root, head, window_days) if head else None
+
 
 def _parse_numstat(log_text: str) -> dict[str, int]:
     """Parse NUL-terminated ``git log --numstat -z`` records.
@@ -218,9 +307,30 @@ def compute_file_churn(
 ) -> dict[str, int]:
     """Count commits touching each file over a trailing window.
 
-    Returns an empty mapping when the window is invalid or Git cannot be
-    queried. Renames are deliberately not followed: churn belongs to the path
-    that existed in each commit.
+    Thin wrapper over :func:`compute_file_churn_with_status` for callers that
+    only want the counts.
+    """
+    return compute_file_churn_with_status(repo_root, window_days)[0]
+
+
+def compute_file_churn_with_status(
+    repo_root: str,
+    window_days: int | None = None,
+) -> tuple[dict[str, int], str]:
+    """Count commits touching each file, and say whether the count is real.
+
+    Memoised per ``(repo, HEAD commit, window)``: the answer cannot change
+    until a new commit lands, and the walk is too expensive to repeat inside
+    every tool call. The history walk is capped at ``_CHURN_MAX_COMMITS`` and
+    given ``_CHURN_TIMEOUT`` seconds.
+
+    Returns ``({}, CHURN_UNAVAILABLE)`` when Git is slow, missing, or fails,
+    which leaves the change-frequency risk term at zero -- exactly the
+    behaviour callers had before churn was enabled for them -- and records
+    that for the life of the process so the next call costs nothing. An
+    invalid or non-positive window is ``CHURN_OFF``: churn was switched off,
+    not attempted and lost. Renames are deliberately not followed: churn
+    belongs to the path that existed in each commit.
     """
     if window_days is None:
         raw_window = os.environ.get("CRG_CHURN_WINDOW_DAYS", "90")
@@ -231,9 +341,24 @@ def compute_file_churn(
                 "Invalid CRG_CHURN_WINDOW_DAYS value %r; churn disabled",
                 raw_window,
             )
-            return {}
+            return {}, CHURN_OFF
     if window_days <= 0:
-        return {}
+        return {}, CHURN_OFF
+
+    # Checked before any subprocess: on the repositories this exists for, the
+    # cheap-looking rev-parse below is itself what times out.
+    fail_key = (repo_root, window_days)
+    if _churn_is_unavailable(fail_key):
+        return {}, CHURN_UNAVAILABLE
+
+    cache_key = _churn_cache_key(repo_root, window_days)
+    if cache_key is None:
+        _mark_churn_unavailable(fail_key)
+        return {}, CHURN_UNAVAILABLE
+    with _CHURN_CACHE_LOCK:
+        cached = _CHURN_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached), CHURN_OK
 
     try:
         result = subprocess.run(
@@ -243,6 +368,7 @@ def compute_file_churn(
                 "core.quotepath=off",
                 "log",
                 f"--since={window_days}.days.ago",
+                f"--max-count={_CHURN_MAX_COMMITS}",
                 "--numstat",
                 "--no-renames",
                 "--format=",
@@ -255,7 +381,7 @@ def compute_file_churn(
             encoding="utf-8",
             errors="replace",
             cwd=repo_root,
-            timeout=_GIT_TIMEOUT,
+            timeout=_CHURN_TIMEOUT,
         )
         if result.returncode != 0:
             logger.warning(
@@ -263,12 +389,19 @@ def compute_file_churn(
                 result.returncode,
                 result.stderr[:200],
             )
-            return {}
+            _mark_churn_unavailable(fail_key)
+            return {}, CHURN_UNAVAILABLE
+        counts = _parse_numstat(result.stdout)
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("git log error: %s", exc)
-        return {}
+        _mark_churn_unavailable(fail_key)
+        return {}, CHURN_UNAVAILABLE
 
-    return _parse_numstat(result.stdout)
+    with _CHURN_CACHE_LOCK:
+        if len(_CHURN_CACHE) >= _CHURN_CACHE_MAX_ENTRIES:
+            _CHURN_CACHE.clear()
+        _CHURN_CACHE[cache_key] = dict(counts)
+    return counts, CHURN_OK
 
 
 # ---------------------------------------------------------------------------
@@ -414,7 +547,10 @@ def analyze_changes(
 
     Returns:
         Dict with ``summary``, ``risk_score``, ``changed_functions``,
-        ``affected_flows``, ``test_gaps``, and ``review_priorities``.
+        ``affected_flows``, ``test_gaps``, ``review_priorities`` and
+        ``churn_status`` (``"ok"``, ``"unavailable"`` when the git history
+        could not be read and the scores therefore exclude the
+        change-frequency term, or ``"off"`` when it was not requested).
     """
     # Compute changed ranges if not provided.
     if changed_ranges is None and repo_root is not None:
@@ -468,10 +604,12 @@ def analyze_changes(
         changed_funcs = changed_funcs[:_max_funcs]
 
     churn_counts: dict[str, int] | None = None
+    churn_status = CHURN_OFF
     if include_churn and repo_root is not None:
+        raw_churn, churn_status = compute_file_churn_with_status(repo_root)
         churn_counts = {}
         root_path = Path(repo_root)
-        for key, count in compute_file_churn(repo_root).items():
+        for key, count in raw_churn.items():
             churn_counts[key] = count
             churn_counts[normalize_file_path(root_path / key)] = count
 
@@ -491,9 +629,23 @@ def analyze_changes(
     affected = get_affected_flows(store, changed_files)
 
     # Detect test gaps: changed functions without TESTED_BY edges.
+    #
+    # Stored file paths are absolute, so test-ness is judged against the path
+    # relative to the repository root: reading ``tests/`` out of an absolute
+    # path would also match a directory above the checkout, and a repository
+    # cloned into a CI workspace named "test" would report no gaps at all
+    # (issue #1023). ``repo_root`` is the caller's; the graph's own recorded
+    # root covers callers that pass none.
+    gap_root = repo_root or store.get_repo_root()
     test_gaps: list[dict[str, Any]] = []
     for node in changed_funcs:
-        if node.is_test:
+        # A symbol that lives in a test file is test code and can never be a
+        # gap in production test coverage. The path is checked as well as the
+        # stored flag so a graph built before the parser marked non-function
+        # test nodes still gives the right answer: those rows carry
+        # ``is_test = 0`` and used to be reported back to the author as their
+        # own tests needing tests (issue #1014).
+        if node.is_test or is_test_file(node.file_path, gap_root):
             continue
         if node.name in _TEST_GAP_EXEMPT_NAMES:
             continue
@@ -545,6 +697,16 @@ def analyze_changes(
             f"  - Warning: analysis capped at {_max_funcs} functions "
             f"(set CRG_MAX_CHANGED_FUNCS to adjust)"
         )
+    if churn_status == CHURN_UNAVAILABLE:
+        # Say it in the summary, not only in a log line nobody reads: the
+        # scores below are missing a term worth up to 0.15, and a reviewer
+        # comparing two runs deserves to know which one was degraded.
+        summary_parts.append(
+            "  - Degraded: change-frequency risk unavailable "
+            f"(git history did not answer within {_CHURN_TIMEOUT:.3g}s; "
+            "set CRG_CHURN_TIMEOUT to raise the budget). Risk scores "
+            "exclude the churn term."
+        )
 
     return {
         "summary": "\n".join(summary_parts),
@@ -554,4 +716,5 @@ def analyze_changes(
         "test_gaps": test_gaps,
         "review_priorities": review_priorities,
         "functions_truncated": funcs_truncated,
+        "churn_status": churn_status,
     }

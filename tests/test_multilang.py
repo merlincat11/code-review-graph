@@ -255,6 +255,26 @@ func (b *Box[T]) Pointer() {}
             if edge.kind == "CONTAINS" and edge.source.endswith("::Box")
         } == {"Box.Value", "Box.Pointer"}
 
+    def test_receiver_type_unwrap_skips_comments_and_parentheses(self):
+        nodes, _ = self.parser.parse_bytes(
+            Path("receiver_shapes.go"),
+            b"""package sample
+type Box[T any] struct{}
+func (b * /*receiver comment */ Box[T]) Commented() {}
+func (b (Box[T])) Parenthesized() {}
+""",
+        )
+
+        parents = {
+            node.name: node.parent_name
+            for node in nodes
+            if node.kind == "Function"
+        }
+        assert parents == {
+            "Commented": "Box",
+            "Parenthesized": "Box",
+        }
+
 
 class TestRustParsing:
     def setup_method(self):
@@ -301,10 +321,12 @@ class TestRustParsing:
         funcs = {n.name for n in self.nodes if n.kind == "Function"}
         assert "create_user" in funcs
         assert "new" in funcs
-        # `create_user` carries no `#[test]` — must stay Function.
+        # `create_user` carries no `#[test]` — must stay Function. The
+        # fixture lives under tests/, so every node in it is test code and
+        # `kind` is what records the attribute detector's answer.
         for n in self.nodes:
             if n.name == "create_user":
-                assert not n.is_test
+                assert n.kind == "Function"
 
 
 class TestJavaParsing:
@@ -1500,7 +1522,9 @@ class TestPHPTestAnnotations:
         nodes, _ = self._parse(tmp_path)
         m = next(n for n in nodes if n.name == "testDatabaseAvailable")
         assert m.kind == "Function"
-        assert m.is_test is False
+        # tests/ExampleTest.php is a test file, so every node in it is
+        # test code; `kind` carries the annotation detector's answer.
+        assert m.is_test is True
 
     def test_docblock_annotation_detected(self, tmp_path):
         nodes, _ = self._parse(tmp_path)
@@ -1539,7 +1563,9 @@ class TestPHPTestAnnotations:
             n for n in nodes if n.name == "unrelated_qualified_attribute"
         )
         assert m.kind == "Function"
-        assert m.is_test is False
+        # tests/ExampleTest.php is a test file, so every node in it is
+        # test code; `kind` carries the annotation detector's answer.
+        assert m.is_test is True
 
     def test_unrelated_aliased_attribute_is_not_detected(self, tmp_path):
         nodes, _ = self._parse(tmp_path)
@@ -1547,19 +1573,25 @@ class TestPHPTestAnnotations:
             n for n in nodes if n.name == "unrelated_aliased_attribute"
         )
         assert m.kind == "Function"
-        assert m.is_test is False
+        # tests/ExampleTest.php is a test file, so every node in it is
+        # test code; `kind` carries the annotation detector's answer.
+        assert m.is_test is True
 
     def test_similar_docblock_tag_is_not_detected(self, tmp_path):
         nodes, _ = self._parse(tmp_path)
         m = next(n for n in nodes if n.name == "documented_helper")
         assert m.kind == "Function"
-        assert m.is_test is False
+        # tests/ExampleTest.php is a test file, so every node in it is
+        # test code; `kind` carries the annotation detector's answer.
+        assert m.is_test is True
 
     def test_plain_method_not_detected(self, tmp_path):
         nodes, _ = self._parse(tmp_path)
         m = next(n for n in nodes if n.name == "helperNotATest")
         assert m.kind == "Function"
-        assert m.is_test is False
+        # tests/ExampleTest.php is a test file, so every node in it is
+        # test code; `kind` carries the annotation detector's answer.
+        assert m.is_test is True
 
 
 class TestPHPImportResolution:
@@ -4169,10 +4201,16 @@ class TestHCLParsing:
         )
 
     def test_path_module_produces_no_edge(self):
-        """path.module must not produce a REFERENCES edge."""
+        """path.module must not produce a REFERENCES edge.
+
+        Only the symbol half of the target is inspected: the file half is an
+        absolute path, so a checkout under any directory whose name contains
+        "path" would otherwise fail this test.
+        """
         path_edges = [
             e for e in self.edges
-            if e.kind == "REFERENCES" and "path" in e.target
+            if e.kind == "REFERENCES"
+            and "path" in e.target.rsplit("::", 1)[-1]
         ]
         assert path_edges == [], (
             f"Spurious 'path' REFERENCES edges: {[e.target for e in path_edges]}"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+from pathlib import Path
 from typing import Any
 
 from ..incremental import (
@@ -12,6 +13,7 @@ from ..incremental import (
     incremental_update,
     resolve_incremental_base,
 )
+from ..parser import normalize_file_path
 from ._common import _get_store
 
 logger = logging.getLogger(__name__)
@@ -47,12 +49,32 @@ def _run_embedding_refresh(
         )
 
 
+def _fts_file_hint(
+    repo_root: str | None,
+    changed_files: list[str] | None,
+) -> list[str] | None:
+    """Spell *changed_files* the way ``nodes.file_path`` stores them.
+
+    Change discovery reports repository-relative paths while the graph keys
+    nodes by their normalised absolute path. A hint that matches nothing is
+    harmless (the delta still repairs every added and removed row) but it
+    buys nothing either, so resolve it whenever the root is known.
+    """
+    if not changed_files:
+        return None
+    if repo_root is None:
+        return [normalize_file_path(path) for path in changed_files]
+    root = Path(repo_root)
+    return [normalize_file_path(root / path) for path in changed_files]
+
+
 def _run_postprocess(
     store: Any,
     build_result: dict[str, Any],
     postprocess: str,
     full_rebuild: bool = False,
     changed_files: list[str] | None = None,
+    repo_root: str | None = None,
     embedding_provider: str | None = None,
     embedding_model: str | None = None,
 ) -> list[str]:
@@ -79,6 +101,15 @@ def _run_postprocess(
             provider=embedding_provider,
             model=embedding_model,
         )
+        # No resolver runs at this level, but edges were still written, so
+        # the certainty column must not be left stale for the query layer.
+        try:
+            store.refresh_target_resolution()
+        except sqlite3.OperationalError as e:
+            logger.warning("Target-resolution refresh failed: %s", e)
+            warnings.append(
+                f"Target-resolution refresh failed: {type(e).__name__}: {e}"
+            )
         return warnings
 
     # Resolve bare and C++ scoped call targets before derived graph steps.
@@ -89,6 +120,9 @@ def _run_postprocess(
         build_result["cpp_scoped_edges_resolved"] = (
             store.resolve_cpp_scoped_call_targets()
         )
+        # Resolvers rewrite bare targets into qualified ones, so the stored
+        # certainty column is only correct once they have all run.
+        store.refresh_target_resolution()
     except sqlite3.OperationalError as e:
         logger.warning("Call-target resolution failed: %s", e)
         warnings.append(
@@ -100,6 +134,7 @@ def _run_postprocess(
     stage_started = time.perf_counter()
     try:
         rows = store.get_nodes_without_signature()
+        signature_rows: list[tuple[str, int]] = []
         for row in rows:
             node_id, name, kind, params, ret = (
                 row[0],
@@ -116,8 +151,10 @@ def _run_postprocess(
                 sig = f"class {name}"
             else:
                 sig = name
-            store.update_node_signature(node_id, sig[:512])
-        store.commit()
+            signature_rows.append((sig[:512], node_id))
+        # Single transaction via executemany instead of one autocommitted
+        # UPDATE per node (issue #721).
+        store.update_node_signatures(signature_rows)
         build_result["signatures_updated"] = True
     except (sqlite3.OperationalError, TypeError, KeyError) as e:
         logger.warning("Signature computation failed: %s", e)
@@ -129,11 +166,21 @@ def _run_postprocess(
 
     stage_started = time.perf_counter()
     try:
-        from code_review_graph.search import rebuild_fts_index
+        from code_review_graph.search import rebuild_fts_index, update_fts_index
 
-        fts_count = rebuild_fts_index(store)
-        build_result["fts_indexed"] = fts_count
-        build_result["fts_rebuilt"] = True
+        if full_rebuild:
+            build_result["fts_indexed"] = rebuild_fts_index(store)
+            build_result["fts_rebuilt"] = True
+        else:
+            # An update knows which files it re-parsed, so the index only has
+            # to rewrite those rows instead of being dropped and repopulated.
+            mode: list[str] = []
+            build_result["fts_indexed"] = update_fts_index(
+                store,
+                _fts_file_hint(repo_root, changed_files),
+                _out_mode=mode,
+            )
+            build_result["fts_rebuilt"] = mode == ["rebuild"]
     except (sqlite3.OperationalError, ImportError) as e:
         logger.warning("FTS index rebuild failed: %s", e)
         warnings.append(f"FTS index rebuild failed: {type(e).__name__}: {e}")
@@ -517,42 +564,72 @@ def build_or_update_graph(
 
         if full_rebuild:
             result = full_build(root, store, recurse_submodules)
+            failed = [str(item.get("file", "?")) for item in result["errors"]]
+            summary = (
+                f"Full build complete: parsed {result['files_parsed']} files, "
+                f"created {result['total_nodes']} nodes and "
+                f"{result['total_edges']} edges."
+            )
+            if failed:
+                summary += f" {len(failed)} file(s) failed to parse: {failed}."
             build_result = {
                 **result,
-                "status": "ok",
+                "status": "partial" if failed else "ok",
                 "build_type": "full",
                 "base_resolved": None,
-                "summary": (
-                    f"Full build complete: parsed {result['files_parsed']} files, "
-                    f"created {result['total_nodes']} nodes and "
-                    f"{result['total_edges']} edges."
-                ),
+                "summary": summary,
             }
         else:
-            result = incremental_update(root, store, base=base_resolved)
-            if result["files_updated"] == 0 and not (
+            try:
+                result = incremental_update(root, store, base=base_resolved)
+            except RuntimeError as exc:
+                # Change discovery or root validation failed before anything was
+                # stored; report it the way every other failure is reported.
+                return {
+                    "status": "error",
+                    "build_type": "incremental",
+                    "base_resolved": base_resolved,
+                    "files_updated": 0,
+                    "errors": [],
+                    "error": str(exc),
+                    "summary": f"Incremental update failed: {exc}",
+                    "postprocess_level": postprocess,
+                }
+            failed = [str(item.get("file", "?")) for item in result["errors"]]
+            if result["files_updated"] == 0 and not failed and not (
                 postprocess == "full" and store.get_metadata("csharp_flows_dirty") == "1"
             ):
+                summary = (
+                    "No changes detected. Graph is up to date."
+                    if result.get("freshness_advanced")
+                    else "No graph changes detected. Freshness metadata was not advanced."
+                )
                 return {
                     **result,
                     "status": "ok",
                     "build_type": "incremental",
                     "base_resolved": base_resolved,
-                    "summary": "No changes detected. Graph is up to date.",
+                    "summary": summary,
                     "postprocess_level": postprocess,
                 }
+            summary = (
+                f"Incremental update: {result['files_updated']} files re-parsed, "
+                f"{result['total_nodes']} nodes and "
+                f"{result['total_edges']} edges updated. "
+                f"Changed: {result['changed_files']}. "
+                f"Dependents also updated: {result['dependent_files']}."
+            )
+            if failed:
+                summary += (
+                    f" {len(failed)} file(s) failed to parse and keep their "
+                    f"previous graph rows: {failed}."
+                )
             build_result = {
                 **result,
-                "status": "ok",
+                "status": "partial" if failed else "ok",
                 "build_type": "incremental",
                 "base_resolved": base_resolved,
-                "summary": (
-                    f"Incremental update: {result['files_updated']} files re-parsed, "
-                    f"{result['total_nodes']} nodes and "
-                    f"{result['total_edges']} edges updated. "
-                    f"Changed: {result['changed_files']}. "
-                    f"Dependents also updated: {result['dependent_files']}."
-                ),
+                "summary": summary,
             }
 
         # Pass changed_files for incremental flow/community detection
@@ -563,6 +640,7 @@ def build_or_update_graph(
             postprocess,
             full_rebuild=full_rebuild,
             changed_files=changed,
+            repo_root=str(root),
             embedding_provider=embedding_provider,
             embedding_model=embedding_model,
         )
@@ -612,6 +690,9 @@ def run_postprocess(
             result["cpp_scoped_edges_resolved"] = (
                 store.resolve_cpp_scoped_call_targets()
             )
+            # Resolvers rewrite bare targets into qualified ones, so the
+            # stored certainty column is only correct once they have run.
+            store.refresh_target_resolution()
         except sqlite3.OperationalError as e:
             logger.warning("Call-target resolution failed: %s", e)
             warnings.append(
@@ -620,6 +701,7 @@ def run_postprocess(
 
         try:
             rows = store.get_nodes_without_signature()
+            signature_rows: list[tuple[str, int]] = []
             for row in rows:
                 node_id, name, kind, params, ret = (
                     row[0],
@@ -636,8 +718,10 @@ def run_postprocess(
                     sig = f"class {name}"
                 else:
                     sig = name
-                store.update_node_signature(node_id, sig[:512])
-            store.commit()
+                signature_rows.append((sig[:512], node_id))
+            # Single transaction via executemany instead of one autocommitted
+            # UPDATE per node (issue #721).
+            store.update_node_signatures(signature_rows)
             result["signatures_updated"] = True
         except (sqlite3.OperationalError, TypeError, KeyError) as e:
             logger.warning("Signature computation failed: %s", e)

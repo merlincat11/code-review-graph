@@ -16,6 +16,16 @@ from .visualization import export_graph_data
 logger = logging.getLogger(__name__)
 
 
+class MissingOptionalDependencyError(ImportError):
+    """An export needs a package that a default install does not ship.
+
+    Subclasses ``ImportError`` so existing callers keep working, but is
+    specific enough that a CLI can catch it and print the one-line install
+    hint instead of a traceback — without swallowing an ImportError raised
+    by a genuinely broken install of a required package.
+    """
+
+
 # -------------------------------------------------------------------
 # JSON export
 # -------------------------------------------------------------------
@@ -359,16 +369,21 @@ def export_svg(store: GraphStore, output_path: Path) -> Path:
 
     Requires matplotlib (optional dependency).
     Returns the path to the written file.
+
+    Raises:
+        MissingOptionalDependencyError: If matplotlib is not installed.
+            Callers on a user-facing surface should print the message and
+            exit non-zero rather than let it become a traceback.
     """
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-    except ImportError:
-        raise ImportError(
-            "matplotlib is required for SVG export. "
-            "Install with: pip install matplotlib"
-        )
+    except ImportError as exc:
+        raise MissingOptionalDependencyError(
+            "SVG export requires matplotlib. "
+            'Run: pip install "code-review-graph[eval]"'
+        ) from exc
 
     import networkx as nx
 

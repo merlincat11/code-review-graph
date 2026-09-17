@@ -41,7 +41,7 @@ def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
 
 _KNOWN_TABLES = frozenset({
     "nodes", "edges", "metadata", "communities", "flows", "flow_memberships", "nodes_fts",
-    "community_summaries", "flow_snapshots", "risk_index",
+    "community_summaries", "flow_snapshots", "risk_index", "nodes_fts_state",
 })
 
 
@@ -64,6 +64,79 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
         (table,),
     ).fetchone()
     return row[0] > 0
+
+
+# The columns ``nodes_fts`` indexes, in table order. Shared with
+# ``search`` so the DDL, the BM25 weight vector, the index-state mirror and
+# the delta delete/insert statements cannot drift apart. Order is
+# load-bearing: ``bm25()`` takes one weight per column positionally, and an
+# external-content table can only name columns that exist on ``nodes``.
+NODES_FTS_COLUMNS: tuple[str, ...] = (
+    "name",
+    "qualified_name",
+    "file_path",
+    "signature",
+    "docstring",
+    "name_tokens",
+)
+
+# The current shape of the FTS5 index over ``nodes``. Shared with
+# ``search.rebuild_fts_index`` so the DDL cannot drift between the migration
+# that creates the table and the rebuild that recreates it.
+NODES_FTS_DDL = """
+CREATE VIRTUAL TABLE nodes_fts USING fts5(
+    {columns},
+    content='nodes', content_rowid='rowid',
+    tokenize='porter unicode61'
+)
+""".format(columns=", ".join(NODES_FTS_COLUMNS))
+
+# ``nodes_fts`` is an external-content table, so removing an entry needs the
+# column values that were indexed, and those are gone once the node row is.
+# ``nodes_fts_state`` mirrors them. It therefore has to carry exactly the
+# columns ``NODES_FTS_COLUMNS`` names; v12 created the first four and v13
+# adds the rest, so the shape is reconciled by column name, not by version.
+NODES_FTS_STATE_TABLE = "nodes_fts_state"
+
+# Bumped whenever the mirror's shape changes: a mirror written under an
+# older value describes an index with fewer columns, so it cannot be used to
+# delete from the current one. ``search.update_fts_index`` reads this and
+# falls back to one full rebuild, which rewrites both sides together.
+FTS_STATE_METADATA_KEY = "fts_state_synced"
+FTS_STATE_VERSION = "2"
+
+
+def ensure_nodes_fts_state(conn: sqlite3.Connection) -> None:
+    """Create or widen ``nodes_fts_state`` to mirror every indexed column.
+
+    Idempotent, and safe on a database created by any earlier version: the
+    table is created when missing and otherwise gains only the columns it
+    does not already have.
+    """
+    columns = ", ".join(f"{name} TEXT" for name in NODES_FTS_COLUMNS)
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {NODES_FTS_STATE_TABLE} ("  # nosec B608
+        f"  node_id INTEGER PRIMARY KEY, {columns})"
+    )
+    existing = {
+        row[1] for row in conn.execute(
+            f"PRAGMA table_info({NODES_FTS_STATE_TABLE})"  # nosec B608
+        )
+    }
+    for name in NODES_FTS_COLUMNS:
+        if name not in existing:
+            conn.execute(
+                f"ALTER TABLE {NODES_FTS_STATE_TABLE} "  # nosec B608
+                f"ADD COLUMN {name} TEXT"
+            )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_nodes_fts_state_file "
+        f"ON {NODES_FTS_STATE_TABLE}(file_path)"  # nosec B608
+    )
+
+
+# Rows updated per executemany() batch in the v13 backfill.
+_BACKFILL_BATCH = 5_000
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +311,184 @@ def _migrate_v9(conn: sqlite3.Connection) -> None:
     logger.info("Migration v9: added edge confidence columns")
 
 
+def _migrate_v10(conn: sqlite3.Connection) -> None:
+    """v10: Add the indexed ``nodes.symbol`` column used by tail lookups.
+
+    ``symbol`` holds the portion of ``qualified_name`` after the first ``::``.
+    Storing it lets a dotted-target lookup be an indexed equality test; the
+    previous ``substr(qualified_name, -n)`` predicate could not use any index
+    and scanned the whole table on every dotted symbol query.
+    """
+    if not _has_column(conn, "nodes", "symbol"):
+        conn.execute("ALTER TABLE nodes ADD COLUMN symbol TEXT")
+    # instr() returns 0 when "::" is absent, in which case the qualified name
+    # is already a bare symbol. Mirrors graph._symbol_of.
+    conn.execute(
+        "UPDATE nodes SET symbol = CASE "
+        "WHEN instr(qualified_name, '::') > 0 "
+        "THEN substr(qualified_name, instr(qualified_name, '::') + 2) "
+        "ELSE qualified_name END"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_nodes_symbol ON nodes(symbol)"
+    )
+    logger.info("Migration v10: added indexed nodes.symbol column")
+
+
+# SQL that classifies one CALLS/REFERENCES edge by whether its target names a
+# node the graph actually indexed. Kept here and imported by graph.py so the
+# migration backfill, the post-build refresh and the read-path fallback can
+# never drift apart.
+TARGET_RESOLUTION_KINDS = ("CALLS", "REFERENCES")
+
+_TARGET_RESOLUTION_TEMPLATE = (
+    "CASE WHEN EXISTS (SELECT 1 FROM nodes crg_res_n "
+    "WHERE crg_res_n.qualified_name = {alias}.target_qualified) "
+    "THEN 'direct' ELSE 'unresolved' END"
+)
+
+# Only these two spellings of the edges table may be interpolated, so no
+# caller-supplied string ever reaches the SQL text.
+_ALLOWED_EDGE_ALIASES = frozenset({"edges", "e"})
+
+
+def target_resolution_expr(alias: str = "edges") -> str:
+    """Return the classification expression bound to one ``edges`` alias."""
+    if alias not in _ALLOWED_EDGE_ALIASES:
+        raise ValueError(f"Unsupported edges alias: {alias!r}")
+    return _TARGET_RESOLUTION_TEMPLATE.format(alias=alias)
+
+
+TARGET_RESOLUTION_EXPR = target_resolution_expr()
+
+
+def _migrate_v11(conn: sqlite3.Connection) -> None:
+    """v11: Add the indexed ``edges.target_resolution`` column.
+
+    A CALLS edge either points at an indexed node or carries a bare name that
+    the read path can only match by name, subject to a receiver-evidence
+    check. Both kinds lived in one undifferentiated pile, so an answer could
+    not say how much of itself was certain. Storing the classification makes
+    the split an indexed group-by rather than a scan that re-derives it, and
+    lets impact analysis exclude the guessed hops.
+
+    ``IMPORTS_FROM`` and the other kinds keep NULL: their targets are file
+    paths and module names, for which "unresolved" would be a false claim.
+    """
+    if not _has_column(conn, "edges", "target_resolution"):
+        conn.execute("ALTER TABLE edges ADD COLUMN target_resolution TEXT")
+    placeholders = ", ".join("?" for _ in TARGET_RESOLUTION_KINDS)
+    conn.execute(
+        f"UPDATE edges SET target_resolution = {TARGET_RESOLUTION_EXPR} "  # noqa: S608
+        f"WHERE kind IN ({placeholders})",
+        TARGET_RESOLUTION_KINDS,
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_edges_kind_target_resolution "
+        "ON edges(kind, target_resolution)"
+    )
+    logger.info("Migration v11: added indexed edges.target_resolution column")
+
+
+def _migrate_v12(conn: sqlite3.Connection) -> None:
+    """v12: Add ``nodes_fts_state``, the mirror of what ``nodes_fts`` holds.
+
+    ``nodes_fts`` is an external content table, so deleting one of its
+    entries requires the column values that were indexed, and those are
+    gone once the node row is deleted.  Mirroring the indexed text here lets
+    an incremental update rewrite just the rows that changed instead of
+    dropping and repopulating the whole index.  The table starts empty; the
+    first index sync after the migration fills it with a full rebuild.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS nodes_fts_state ("
+        "  node_id INTEGER PRIMARY KEY,"
+        "  name TEXT,"
+        "  qualified_name TEXT,"
+        "  file_path TEXT,"
+        "  signature TEXT"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_nodes_fts_state_file "
+        "ON nodes_fts_state(file_path)"
+    )
+    logger.info("Migration v12: added nodes_fts_state index mirror")
+
+
+def _migrate_v13(conn: sqlite3.Connection) -> None:
+    """v13: index node docstrings and identifier word splits in FTS5.
+
+    ``nodes.extra['docstring']`` was already extracted by the parser and fed
+    to the embedding text builder, but the FTS5 index could not see it: an
+    external-content table can only index real columns of its content table.
+    Two columns are added and backfilled, then ``nodes_fts`` is recreated
+    with both so existing graphs gain the prose without a full reparse.
+
+    ``name_tokens`` carries the camelCase/PascalCase splits that the
+    ``unicode61`` tokenizer cannot produce (``hashPassword`` is one token to
+    it, so ``password`` never matched).
+
+    The v12 index-state mirror is widened to the same two columns and
+    refilled from the rebuild this migration just ran, so the incremental
+    delta path keeps the values it needs to delete an entry with.
+    """
+    # Imported here, not at module scope: graph imports migrations, so the
+    # reverse edge can only be taken at call time. run_migrations is invoked
+    # from GraphStore.__init__, by which point graph is fully imported.
+    from .graph import node_index_tokens
+
+    if not _has_column(conn, "nodes", "docstring"):
+        conn.execute("ALTER TABLE nodes ADD COLUMN docstring TEXT")
+    if not _has_column(conn, "nodes", "name_tokens"):
+        conn.execute("ALTER TABLE nodes ADD COLUMN name_tokens TEXT")
+
+    # The docstring backfill is pure SQL; json_extract returns NULL for rows
+    # whose extra holds no docstring, which is exactly the wanted value.
+    conn.execute(
+        "UPDATE nodes SET docstring = "
+        "substr(trim(json_extract(extra, '$.docstring')), 1, 400) "
+        "WHERE docstring IS NULL AND extra IS NOT NULL AND json_valid(extra) "
+        "AND json_type(extra, '$.docstring') = 'text'"
+    )
+
+    # The camelCase split has no SQL equivalent, so it runs in Python once.
+    pending: list[tuple[str, int]] = []
+    cursor = conn.execute(
+        "SELECT id, kind, name, parent_name, file_path FROM nodes"
+    )
+    for row in cursor.fetchall():
+        node_id, kind, name, parent, path = (row[0], row[1], row[2], row[3], row[4])
+        pending.append((node_index_tokens(kind, name, parent, path), node_id))
+        if len(pending) >= _BACKFILL_BATCH:
+            conn.executemany(
+                "UPDATE nodes SET name_tokens = ? WHERE id = ?", pending
+            )
+            pending.clear()
+    if pending:
+        conn.executemany("UPDATE nodes SET name_tokens = ? WHERE id = ?", pending)
+
+    conn.execute("DROP TABLE IF EXISTS nodes_fts")
+    conn.execute(NODES_FTS_DDL)
+    conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
+
+    # The index now carries two columns the v12 mirror has no room for, and
+    # an entry can only be deleted by replaying every indexed value. Widen
+    # the mirror and refill it from the rebuild that just ran.
+    ensure_nodes_fts_state(conn)
+    columns = ", ".join(NODES_FTS_COLUMNS)
+    conn.execute(f"DELETE FROM {NODES_FTS_STATE_TABLE}")  # nosec B608
+    conn.execute(
+        f"INSERT INTO {NODES_FTS_STATE_TABLE} (node_id, {columns}) "  # nosec B608
+        f"SELECT id, {columns} FROM nodes"
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+        (FTS_STATE_METADATA_KEY, FTS_STATE_VERSION),
+    )
+    logger.info("Migration v13: indexed nodes.docstring and nodes.name_tokens")
+
+
 # ---------------------------------------------------------------------------
 # Migration registry
 # ---------------------------------------------------------------------------
@@ -251,6 +502,10 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     7: _migrate_v7,
     8: _migrate_v8,
     9: _migrate_v9,
+    10: _migrate_v10,
+    11: _migrate_v11,
+    12: _migrate_v12,
+    13: _migrate_v13,
 }
 
 LATEST_VERSION = max(MIGRATIONS.keys())

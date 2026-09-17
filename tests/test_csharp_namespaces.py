@@ -468,6 +468,30 @@ def test_global_usings_are_project_scoped_and_rebound_on_update(tmp_path):
         assert _calls(store, "One.C.Go")[0]["target_qualified"].endswith("::Other.Service.Run")
 
 
+def test_project_only_rebinding_refreshes_stored_target_resolution(tmp_path):
+    with _build(tmp_path, {
+        "One.csproj": "<Project />",
+        "Imports.cs": "global using Other;",
+        "Caller.cs": "class C { void Go() { Service.Run(); } }",
+        "Service.cs": "namespace Other; class Service { public static void Run() {} }",
+    }) as store:
+        store.refresh_target_resolution()
+        assert _calls(store, "C.Go")[0]["target_resolution"] == "direct"
+        second_project = tmp_path / "Two.csproj"
+        second_project.write_text("<Project />", encoding="utf-8")
+        result = incremental_update(tmp_path, store, changed_files=["Two.csproj"])
+        assert result["files_updated"] == 0
+        call, = _calls(store, "C.Go")
+        assert call["target_qualified"] == "Service::Run"
+        assert call["target_resolution"] == "unresolved"
+        second_project.unlink()
+        result = incremental_update(tmp_path, store, changed_files=["Two.csproj"])
+        assert result["files_updated"] == 0
+        call, = _calls(store, "C.Go")
+        assert call["target_qualified"].endswith("::Other.Service.Run")
+        assert call["target_resolution"] == "direct"
+
+
 @pytest.mark.parametrize("postprocess", ["full", "minimal", "none"])
 def test_rebinding_refreshes_flows_for_unchanged_callers(tmp_path, postprocess):
     from code_review_graph.flows import get_flows, store_flows, trace_flows
@@ -615,6 +639,46 @@ def test_upgrade_retries_only_failed_files_and_bypasses_unchanged_hash(tmp_path,
         assert store.get_metadata("csharp_identity_pending_files") == "[]"
         assert store.get_node(f"{tmp_path / 'Bad.cs'}::Bad.C.Run") is not None
         assert store.get_node(f"{tmp_path / 'Bad.cs'}::C.Run") is None
+
+
+def test_mixed_cpp_csharp_identity_retries_preserve_both_checkpoints(tmp_path):
+    from code_review_graph.incremental import CPP_IDENTITY_VERSION, full_build
+
+    (tmp_path / "Bad.cs").write_text("namespace App; class C { void Run() {} }")
+    (tmp_path / "Bad.cpp").write_text("void run(int value) {}")
+    (tmp_path / "Good.py").write_text("def run(): pass")
+    with GraphStore(tmp_path / ".code-review-graph" / "graph.db") as store:
+        full_build(tmp_path, store)
+        store.set_metadata("cpp_identity_version", "0")
+        store.set_metadata("cpp_identity_pending", "null")
+        store.set_metadata("csharp_identity_version", "4")
+        parser = CodeParser.parse_bytes
+        attempts = []
+
+        def fail_bad(self, path, source):
+            attempts.append(path.name)
+            if path.name in ("Bad.cs", "Bad.cpp"):
+                raise ValueError("persistent parser failure")
+            return parser(self, path, source)
+
+        with patch.object(CodeParser, "parse_bytes", fail_bad):
+            upgraded = incremental_update(tmp_path, store, changed_files=[])
+            assert upgraded["identity_rebuild"]
+            assert set(attempts) == {"Bad.cs", "Bad.cpp", "Good.py"}
+            attempts.clear()
+            retried = incremental_update(tmp_path, store, changed_files=[])
+            assert set(attempts) == {"Bad.cs", "Bad.cpp"}
+            assert len(retried["errors"]) == 2
+            assert store.get_metadata("cpp_identity_version") == "0"
+            assert json.loads(store.get_metadata("cpp_identity_pending"))["files"] == ["Bad.cpp"]
+            assert json.loads(store.get_metadata("csharp_identity_pending_files")) == ["Bad.cs"]
+        recovered = incremental_update(tmp_path, store, changed_files=[])
+        assert recovered["files_updated"] == 2
+        assert recovered["errors"] == []
+        assert store.get_metadata("cpp_identity_version") == CPP_IDENTITY_VERSION
+        assert store.get_metadata("csharp_identity_version") == CSHARP_IDENTITY_VERSION
+        assert json.loads(store.get_metadata("cpp_identity_pending"))["files"] == []
+        assert store.get_metadata("csharp_identity_pending_files") == "[]"
 
 
 def test_deleted_callee_keeps_raw_reference_for_recreation(tmp_path):
