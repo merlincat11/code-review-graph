@@ -43,12 +43,14 @@ import fnmatch
 import json
 import logging
 import os
+import sqlite3
 from functools import partial
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as pkg_version
 from pathlib import Path
 from typing import Iterable, TypedDict
 
+from .errors import CodeReviewGraphError, is_lock_error
 from .neighbourhood import DEFAULT_DEPTH as NB_DEFAULT_DEPTH
 from .neighbourhood import DEFAULT_MAX_NODES as NB_DEFAULT_MAX_NODES
 
@@ -694,8 +696,94 @@ def _warn_failed_files(result: dict) -> None:
     )
 
 
-# Subparsers that main() needs after parsing, to print a subcommand's help or
-# raise a subcommand-scoped usage error. Populated by build_parser().
+def _open_graph_store(db_path: Path, command: str):
+    """Open the graph store, recovering from an unusable database file.
+
+    A restored CI cache can hold a truncated or half-written ``graph.db``,
+    and it can just as easily hold a valid SQLite file whose tables are the
+    wrong shape. SQLite refuses either one and the command used to die with a
+    traceback, which is why ``action.yml``'s ``update || build`` fallback
+    could not recover: the full build failed for exactly the same reason.
+    ``build`` rewrites the graph from scratch, so there the bad file is
+    discarded and the build proceeds.
+
+    Every other command re-raises, and ``main`` prints the one actionable
+    line the error already carries. That is the whole difference between the
+    two paths, and it is worth stating why the reporting is not duplicated
+    here: a second message would compete with the first, and one of them
+    would drift.
+
+    ``build`` discards only what ``CorruptGraphDatabaseError`` names, and
+    that class is deliberately narrow. A contended database, a read-only
+    checkout, a foreign SQLite file and a graph from a newer release all
+    reach ``main`` as themselves, because deleting any of those would destroy
+    a graph, or data, that is not broken.
+    """
+    from .graph import CorruptGraphDatabaseError, GraphStore, discard_corrupt_database
+
+    try:
+        return GraphStore(db_path)
+    except CorruptGraphDatabaseError as exc:
+        if command != "build":
+            raise
+        logger.warning(
+            "Graph database at %s is unusable (%s); discarding it and "
+            "building from scratch.",
+            db_path, exc.reason,
+        )
+        discard_corrupt_database(db_path)
+        return GraphStore(db_path)
+
+
+def main() -> None:
+    """Main CLI entry point.
+
+    Two families of failure are reported here rather than raised, because
+    both of them are things the tool understands about itself.
+
+    Everything the tool can explain is raised as a
+    :class:`~code_review_graph.errors.CodeReviewGraphError` (a corrupt or
+    foreign graph, a data directory it may not write to, a VCS it could not
+    run) and printed in the house style the rest of the CLI already uses:
+    one ``Error: ...`` line on stderr, exit 1, no traceback to decode.
+
+    One of those is reported here only because nothing could be done about
+    it earlier: an unreadable graph reaches ``build`` as a rebuild (see
+    ``_open_graph_store``) and only every other command as a line.
+
+    A contended graph is separate, and stays separate: it is reported, not
+    raised, and never described as damage. The choice is deliberate:
+    ``build`` and ``update`` are run from pre-commit hooks and editor hooks
+    where blocking indefinitely would look like a hang, and retrying past
+    SQLite's five-second wait would only lengthen a hang whose real cause is
+    another process that has not finished. Failing immediately is also the
+    recoverable outcome — the VCS anchor is written only by a build that ran
+    to completion, so nothing marks the half-written graph as current and the
+    next run rebuilds it.
+
+    Anything else really is a bug and keeps its traceback.
+    """
+    try:
+        _dispatch()
+    except CodeReviewGraphError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
+    except sqlite3.OperationalError as exc:
+        if not is_lock_error(exc):
+            raise
+        print(
+            f"Error: another process is updating this graph ({exc}).\n"
+            "Nothing was written, and no freshness anchor was recorded, so the "
+            "graph is unchanged.\n"
+            "Wait for the other process (a watcher, a daemon, or another "
+            "code-review-graph run) to finish and try again.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
+
+
+# Subparsers that _dispatch() needs after parsing, to print a subcommand's help
+# or raise a subcommand-scoped usage error. Populated by build_parser().
 _SUBCOMMANDS: dict[str, argparse.ArgumentParser] = {}
 
 
@@ -801,7 +889,7 @@ def _describe_visualization(
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser.
 
-    Split out of :func:`main` so tests can assert on the flag surface
+    Split out of :func:`_dispatch` so tests can assert on the flag surface
     without executing a command.
     """
     ap = argparse.ArgumentParser(
@@ -1572,8 +1660,8 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def main() -> None:
-    """Main CLI entry point."""
+def _dispatch() -> None:
+    """Parse arguments and run the requested subcommand."""
     _configure_utf8_stdio()
     ap = build_parser()
     args = ap.parse_args()
@@ -1834,8 +1922,8 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-    from .graph import GraphStore
     from .incremental import (
+        assert_graph_serves_root,
         find_project_root,
         find_repo_root,
         get_db_path,
@@ -1846,7 +1934,7 @@ def main() -> None:
         repo_root = Path(args.repo) if args.repo else find_project_root()
         _handle_data_dir_option(args, repo_root)
         db_path = get_db_path(repo_root)
-        store = GraphStore(db_path)
+        store = _open_graph_store(db_path, args.command)
         try:
             from .tools.build import run_postprocess
 
@@ -1865,6 +1953,16 @@ def main() -> None:
             if result.get("fts_indexed"):
                 parts.append(f"{result['fts_indexed']} FTS entries")
             print(f"Post-processing: {', '.join(parts) or 'done'}")
+            if result.get("build_incomplete"):
+                # Post-processing rebuilt derived data for the nodes that are
+                # stored, which is not the same as a repaired graph: the build
+                # that stored them never finished, so files are still missing.
+                print(
+                    "Build state: INCOMPLETE - the last build stopped before "
+                    "every file was stored, so files are still missing from "
+                    "the graph. Post-processing cannot add them. Run "
+                    "'code-review-graph build' to rebuild."
+                )
         finally:
             store.close()
         return
@@ -1956,7 +2054,17 @@ def main() -> None:
             file=sys.stderr,
         )
         raise SystemExit(1)
-    store = GraphStore(db_path)
+    store = _open_graph_store(db_path, args.command)
+
+    try:
+        # A graph.db copied or cached from another checkout answers every
+        # question with that repository's symbols and absolute paths. The
+        # write side has refused that since #909; the read side used to
+        # accept it in silence.
+        assert_graph_serves_root(repo_root, store)
+    except BaseException:
+        store.close()
+        raise
 
     try:
         if args.command == "dead-code":
@@ -2072,22 +2180,15 @@ def main() -> None:
                     estimate_file_tokens,
                     format_context_savings_panel,
                 )
-                from .incremental import (
-                    get_changed_files,
-                    get_staged_and_unstaged,
-                    resolve_review_base,
-                )
+                from .incremental import discover_review_changes
 
                 # Reuse the base the update actually resolved to (args.base is
                 # None by default now, which get_changed_files cannot accept),
                 # then apply the same merge-base rule as detect-changes so a
                 # branch ref scopes the summary to this branch's own commits.
-                brief_base = resolve_review_base(
+                changed, brief_base = discover_review_changes(
                     repo_root, result.get("base_resolved") or "HEAD~1"
                 )
-                changed = get_changed_files(repo_root, brief_base)
-                if not changed:
-                    changed = get_staged_and_unstaged(repo_root)
                 if changed:
                     impact = analyze_changes(
                         store,
@@ -2124,7 +2225,12 @@ def main() -> None:
                         print(panel)
 
         elif args.command == "status":
+            from .build_state import BUILD_IN_PROGRESS, read_build_state
+            from .tools.build import build_was_interrupted
+
             stats = store.get_stats()
+            interrupted = build_was_interrupted(store)
+            files_missing = read_build_state(store) == BUILD_IN_PROGRESS
             stored_branch = store.get_metadata("git_branch")
             stored_sha = store.get_metadata("git_head_sha")
             from .incremental import _git_branch_info, detect_vcs
@@ -2151,6 +2257,7 @@ def main() -> None:
                     "current_sha": current_sha,
                     "svn_branch": stored_svn_branch,
                     "svn_revision": stored_rev,
+                    "build_incomplete": interrupted,
                 }))
             elif not args.quiet:
                 print(f"Nodes: {stats.total_nodes}")
@@ -2158,6 +2265,23 @@ def main() -> None:
                 print(f"Files: {stats.files_count}")
                 print(f"Languages: {', '.join(stats.languages)}")
                 print(f"Last updated: {stats.last_updated or 'never'}")
+                if interrupted and files_missing:
+                    # Nothing derived can put back a file that was never
+                    # parsed, so this one names the repair that works.
+                    print(
+                        "Build state: INCOMPLETE - the last build stopped "
+                        "before every file was stored, so files are missing "
+                        "from the graph. Run 'code-review-graph build' to "
+                        "rebuild it."
+                    )
+                elif interrupted:
+                    # The nodes can all be present and the graph still be a
+                    # half-built one: search and flows are derived afterwards.
+                    print(
+                        "Build state: INCOMPLETE - the last build stopped before "
+                        "post-processing finished, so search and flows may be "
+                        "missing. Run 'code-review-graph update' to repair it."
+                    )
                 if stored_branch:
                     print(f"Built on branch: {stored_branch}")
                 if stored_sha:
@@ -2373,12 +2497,16 @@ def main() -> None:
                 attach_context_savings,
                 estimate_file_tokens,
             )
-            from .incremental import get_changed_files, get_staged_and_unstaged, resolve_review_base
+            from .incremental import discover_review_changes
 
-            base = resolve_review_base(repo_root, args.base)
-            changed = get_changed_files(repo_root, base)
-            if not changed:
-                changed = get_staged_and_unstaged(repo_root)
+            # discover_review_changes runs the same three steps on the
+            # short discovery budget, with require_vcs throughout: this
+            # command's exit code is a review gate, so "I could not look"
+            # must never render as "there is nothing to review" — a CI job
+            # keyed on exit 0 would wave through a pull request nobody read.
+            # ChangeDiscoveryError reaches main() and becomes one
+            # `Error: ...` line and exit 1.
+            changed, base = discover_review_changes(repo_root, args.base)
 
             if not changed:
                 print("No changes detected.")
@@ -2389,6 +2517,7 @@ def main() -> None:
                     repo_root=str(repo_root),
                     base=base,
                     include_churn=getattr(args, "churn", False),
+                    require_vcs=True,
                 )
                 original_tokens = estimate_file_tokens(repo_root, changed)
                 attach_context_savings(

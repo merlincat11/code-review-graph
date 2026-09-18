@@ -14,7 +14,10 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from .constants import GIT_TIMEOUT as _GIT_TIMEOUT
 from .constants import SECURITY_KEYWORDS as _SECURITY_KEYWORDS
+from .constants import env_float, env_int
+from .errors import ChangeDiscoveryError
 from .flows import get_affected_flows
 from .graph import GraphNode, GraphStore, _sanitize_name, node_to_dict
 from .parser import is_test_file, normalize_file_path
@@ -32,8 +35,17 @@ _TEST_GAP_EXEMPT_NAMES = frozenset({
     "__construct", "__init__", "__destruct",
 })
 
-_GIT_TIMEOUT = int(os.environ.get("CRG_GIT_TIMEOUT", "30"))  # seconds, configurable
-
+# Being reached by a tested caller buys no risk discount at all. It was worth
+# 0.03 briefly and that was wrong twice over. Evidentially: a static CALLS path
+# shows the symbol is reachable, not that any test runs it -- about 6% of the
+# symbols the walk reaches are never executed by this repository's own suite.
+# Mechanically: every other term here moves in multiples of 0.05 and the scores
+# quantize hard (one real delta produced 15 distinct scores over 49 symbols,
+# with 25 tied at 0.05), so a 0.03 nudge could never leave a symbol tied -- it
+# dropped it below its whole tie class, and `review_priorities` is
+# `sorted(...)[:10]`. On the delta of #1047 that evicted the one genuinely
+# untested symbol from the table the Action renders. The classification is
+# reported in its own field instead, where it informs without displacing.
 _SAFE_GIT_REF = re.compile(r"^[A-Za-z0-9_.~^/@{}\-]+$")
 _SAFE_SVN_REV = re.compile(r"^r?\d+(:r?\d+|:HEAD|:BASE|:COMMITTED)?$", re.IGNORECASE)
 
@@ -43,15 +55,40 @@ _SAFE_SVN_REV = re.compile(r"^r?\d+(:r?\d+|:HEAD|:BASE|:COMMITTED)?$", re.IGNORE
 # ---------------------------------------------------------------------------
 
 
+def _vcs_unavailable(tool: str, exc: BaseException) -> ChangeDiscoveryError:
+    """Describe a VCS command that could not be run at all.
+
+    Mirrors :func:`code_review_graph.incremental._vcs_unavailable`; a missing
+    binary and a timeout say nothing about the working tree, so no caller may
+    read them as "no lines changed".
+    """
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return ChangeDiscoveryError(
+            f"could not determine the changed lines: {tool} timed out after "
+            f"{_GIT_TIMEOUT}s. Raise CRG_GIT_TIMEOUT, or re-run when the "
+            "repository is not busy."
+        )
+    return ChangeDiscoveryError(
+        f"could not determine the changed lines: {tool} could not be run "
+        f"({exc}). Install {tool} and make sure it is on PATH."
+    )
+
+
 def parse_git_diff_ranges(
     repo_root: str,
     base: str = "HEAD~1",
+    *,
+    require_vcs: bool = False,
 ) -> dict[str, list[tuple[int, int]]]:
     """Run ``git diff --unified=0`` and extract changed line ranges per file.
 
     Args:
         repo_root: Absolute path to the repository root.
         base: Git ref to diff against (default: ``HEAD~1``).
+        require_vcs: Raise
+            :class:`~code_review_graph.errors.ChangeDiscoveryError` when git
+            cannot be run at all, instead of returning an empty mapping that
+            a caller would read as "no lines changed".
 
     Returns:
         Mapping of file paths to lists of ``(start_line, end_line)`` tuples.
@@ -76,6 +113,8 @@ def parse_git_diff_ranges(
             return {}
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("git diff error: %s", exc)
+        if require_vcs:
+            raise _vcs_unavailable("git", exc) from exc
         return {}
 
     return _parse_unified_diff(result.stdout)
@@ -84,6 +123,8 @@ def parse_git_diff_ranges(
 def parse_svn_diff_ranges(
     repo_root: str,
     rev_range: str | None = None,
+    *,
+    require_vcs: bool = False,
 ) -> dict[str, list[tuple[int, int]]]:
     """Run ``svn diff`` and extract changed line ranges per file.
 
@@ -118,6 +159,8 @@ def parse_svn_diff_ranges(
             return {}
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("svn diff error: %s", exc)
+        if require_vcs:
+            raise _vcs_unavailable("svn", exc) from exc
         return {}
 
     return _parse_unified_diff(result.stdout)
@@ -126,6 +169,8 @@ def parse_svn_diff_ranges(
 def parse_diff_ranges(
     repo_root: str,
     base: str = "HEAD~1",
+    *,
+    require_vcs: bool = False,
 ) -> dict[str, list[tuple[int, int]]]:
     """Auto-detect VCS and return changed line ranges per file.
 
@@ -138,12 +183,90 @@ def parse_diff_ranges(
               For SVN: an optional revision range (e.g. ``"r100:HEAD"``);
               when *base* is not a valid SVN revision, working-copy changes
               (``svn diff``) are used instead.
+        require_vcs: Raise
+            :class:`~code_review_graph.errors.ChangeDiscoveryError` when the
+            VCS binary is missing or times out, instead of returning ``{}``.
     """
     root_path = Path(repo_root)
     if (root_path / ".svn").exists():
         rev_range = base if _SAFE_SVN_REV.match(base) else None
-        return parse_svn_diff_ranges(repo_root, rev_range)
-    return parse_git_diff_ranges(repo_root, base)
+        return parse_svn_diff_ranges(repo_root, rev_range, require_vcs=require_vcs)
+    return parse_git_diff_ranges(repo_root, base, require_vcs=require_vcs)
+
+
+_C_QUOTE_ESCAPES = {
+    "a": "\a", "b": "\b", "f": "\f", "n": "\n",
+    "r": "\r", "t": "\t", "v": "\v", "\\": "\\", '"': '"',
+}
+
+
+def _unquote_c_path(quoted: str) -> str:
+    """Decode git's C-style quoted path back to text.
+
+    With ``core.quotePath`` (the default) git writes a path containing a
+    non-ASCII or control byte as ``"src/caf\\303\\251.py"``: double-quoted,
+    with backslash escapes and three-digit octal escapes for raw bytes. The
+    octal escapes are UTF-8 bytes, so they are reassembled before decoding.
+    """
+    raw = bytearray()
+    index, end = 1, len(quoted) - 1
+    while index < end:
+        char = quoted[index]
+        if char != "\\":
+            raw.extend(char.encode("utf-8"))
+            index += 1
+            continue
+        nxt = quoted[index + 1] if index + 1 < end else ""
+        if nxt in _C_QUOTE_ESCAPES:
+            raw.extend(_C_QUOTE_ESCAPES[nxt].encode("utf-8"))
+            index += 2
+            continue
+        octal = ""
+        while len(octal) < 3 and index + 1 + len(octal) < end:
+            digit = quoted[index + 1 + len(octal)]
+            if digit not in "01234567":
+                break
+            octal += digit
+        if octal:
+            raw.append(int(octal, 8) & 0xFF)
+            index += 1 + len(octal)
+            continue
+        raw.extend(b"\\")
+        index += 1
+    return raw.decode("utf-8", "replace")
+
+
+def _diff_header_path(rest: str) -> str | None:
+    """Extract the post-image path from the text after ``+++ ``.
+
+    Git writes the path three ways, and only the plainest one is a bare
+    ``b/path``: it appends a TAB when the path contains a space, and
+    C-quotes the whole ``"b/path"`` when it contains a non-ASCII or control
+    byte. Returns None for ``/dev/null``, the post-image of a deleted file.
+    """
+    rest = rest.rstrip("\r")
+    if rest.startswith('"'):
+        closing = rest.rfind('"')
+        path = _unquote_c_path(rest[: closing + 1])
+    else:
+        # The trailing TAB is a separator, never part of the path: git emits
+        # one only when the path itself contains a space.
+        path = rest.split("\t", 1)[0]
+    if path.startswith("b/"):
+        path = path[2:]
+        return path or None
+    return None
+
+
+# The post-image header, in every spelling git writes it: a bare ``b/path``,
+# the same with the TAB git appends when the path contains a space, the
+# C-quoted ``"b/path"`` it uses when the path contains a non-ASCII or
+# control byte, and ``/dev/null`` for a deleted file. Anchored on those
+# three shapes so an added line that merely starts with "+++ " is not read
+# as a header.
+_POST_IMAGE_HEADER = re.compile(
+    r'^\+\+\+ (/dev/null|"b/(?:[^"\\]|\\.)*"|b/.*)$'
+)
 
 
 def _parse_unified_diff(diff_text: str) -> dict[str, list[tuple[int, int]]]:
@@ -154,15 +277,13 @@ def _parse_unified_diff(diff_text: str) -> dict[str, list[tuple[int, int]]]:
     ranges: dict[str, list[tuple[int, int]]] = {}
     current_file: str | None = None
 
-    # Match "+++ b/path/to/file"
-    file_pattern = re.compile(r"^\+\+\+ b/(.+)$")
     # Match "@@ ... +start,count @@" or "@@ ... +start @@"
     hunk_pattern = re.compile(r"^@@ .+? \+(\d+)(?:,(\d+))? @@")
 
     for line in diff_text.splitlines():
-        file_match = file_pattern.match(line)
+        file_match = _POST_IMAGE_HEADER.match(line)
         if file_match:
-            current_file = file_match.group(1)
+            current_file = _diff_header_path(file_match.group(1))
             continue
 
         hunk_match = hunk_pattern.match(line)
@@ -192,8 +313,11 @@ _NUMSTAT_COUNT = re.compile(r"^(?:\d+|-)$")
 # 30-second diff timeout: the history walk is capped at a commit count, and a
 # slow repository degrades to the pre-churn behaviour (an empty mapping, and
 # therefore a zero change-frequency term) instead of hanging the call.
-_CHURN_TIMEOUT = float(os.environ.get("CRG_CHURN_TIMEOUT", "5"))
-_CHURN_MAX_COMMITS = int(os.environ.get("CRG_CHURN_MAX_COMMITS", "2000"))
+# Read through the shared helpers (#912): a typo in either variable falls
+# back to the documented default and warns by name, rather than aborting the
+# import of every command with a bare ValueError.
+_CHURN_TIMEOUT = env_float("CRG_CHURN_TIMEOUT", 5.0)
+_CHURN_MAX_COMMITS = env_int("CRG_CHURN_MAX_COMMITS", 2000)
 
 # Churn counts commits, so the answer only changes when HEAD does: successful
 # results are keyed by (repo, commit, window).
@@ -469,6 +593,11 @@ def compute_risk_score(
       - Caller count: callers / 20, capped at 0.10
       - Change frequency (opt-in): commits touching the file / 10, capped
         at 0.15
+
+    Only direct and transitive TESTED_BY edges move the coverage term. A
+    symbol that merely sits under a tested caller scores as untested here; see
+    :meth:`~code_review_graph.graph.GraphStore.get_caller_test_routes` for why
+    that reachability is reported beside the score rather than folded into it.
     """
     score = 0.0
 
@@ -530,6 +659,7 @@ def analyze_changes(
     repo_root: str | None = None,
     base: str = "HEAD~1",
     include_churn: bool = False,
+    require_vcs: bool = False,
 ) -> dict[str, Any]:
     """Analyze changes and produce risk-scored review guidance.
 
@@ -544,6 +674,10 @@ def analyze_changes(
         include_churn: Add an opt-in change-frequency term to each node's
             risk score. The trailing window defaults to 90 days and can be
             configured with ``CRG_CHURN_WINDOW_DAYS``.
+        require_vcs: Raise
+            :class:`~code_review_graph.errors.ChangeDiscoveryError` when the
+            diff cannot be read at all, rather than silently degrading to a
+            file-level analysis. Review gates pass this.
 
     Returns:
         Dict with ``summary``, ``risk_score``, ``changed_functions``,
@@ -551,8 +685,16 @@ def analyze_changes(
         ``churn_status`` (``"ok"``, ``"unavailable"`` when the git history
         could not be read and the scores therefore exclude the
         change-frequency term, or ``"off"`` when it was not requested).
+
+        Each ``test_gaps`` entry carries ``coverage``: ``"none"`` when no test
+        reaches the symbol at all, or ``"indirect"`` when one only reaches it
+        through a caller -- those entries also carry ``covered_via``,
+        ``covered_depth`` and ``covered_by``. Unreached entries sort first, and
+        ``test_gaps_uncovered``/``test_gaps_indirect`` hold the two counts for
+        consumers that truncate the list.
     """
     # Compute changed ranges if not provided.
+    ranges_unavailable = ""
     if changed_ranges is None and repo_root is not None:
         # Diff keys are forward-slash paths relative to the repo root, but
         # the graph stores absolute native paths. Remap so lookups work on
@@ -562,9 +704,23 @@ def analyze_changes(
         # explicit changed_ranges path (MCP) is untouched — tools/review.py
         # remaps before calling, and remapping twice would corrupt keys.
         root_path = Path(repo_root)
+        try:
+            raw_ranges = parse_diff_ranges(repo_root, base, require_vcs=require_vcs)
+        except ChangeDiscoveryError as exc:
+            if not changed_files:
+                # Nothing else to go on: an empty answer here would be an
+                # all-clear the tool has not earned.
+                raise
+            # The changed files are already known, so an unreadable
+            # line-level diff costs precision, not honesty. Degrade to
+            # whole-file scoring and say so in the summary rather than
+            # presenting a file-level answer as a line-level one.
+            logger.warning("%s; scoring whole files instead", exc)
+            ranges_unavailable = str(exc)
+            raw_ranges = {}
         changed_ranges = {
             normalize_file_path(root_path / key): ranges
-            for key, ranges in parse_diff_ranges(repo_root, base).items()
+            for key, ranges in raw_ranges.items()
         }
 
     # The affected-flows lookup and the no-ranges fallback match
@@ -598,7 +754,7 @@ def analyze_changes(
     ]
 
     # Cap to prevent O(N*M) query explosion on large PRs.
-    _max_funcs = int(os.environ.get("CRG_MAX_CHANGED_FUNCS", "500"))
+    _max_funcs = env_int("CRG_MAX_CHANGED_FUNCS", 500)
     funcs_truncated = len(changed_funcs) > _max_funcs
     if funcs_truncated:
         changed_funcs = changed_funcs[:_max_funcs]
@@ -612,6 +768,51 @@ def analyze_changes(
         for key, count in raw_churn.items():
             churn_counts[key] = count
             churn_counts[normalize_file_path(root_path / key)] = count
+
+    # Classify test coverage before scoring: the same answer decides both the
+    # gap report and the coverage term of every node's risk score, and doing
+    # it once for the whole change set keeps it to a handful of batched
+    # queries instead of a walk per symbol.
+    #
+    # Stored file paths are absolute, so test-ness is judged against the path
+    # relative to the repository root: reading ``tests/`` out of an absolute
+    # path would also match a directory above the checkout, and a repository
+    # cloned into a CI workspace named "test" would report no gaps at all
+    # (issue #1023). ``repo_root`` is the caller's; the graph's own recorded
+    # root covers callers that pass none.
+    gap_root = repo_root or store.get_repo_root()
+    # A symbol that lives in a test file is test code and can never be a gap
+    # in production test coverage. The path is checked as well as the stored
+    # flag so a graph built before the parser marked non-function test nodes
+    # still gives the right answer: those rows carry ``is_test = 0`` and used
+    # to be reported back to the author as their own tests needing tests
+    # (issue #1014).
+    gap_candidates = [
+        node for node in changed_funcs
+        if not (node.is_test or is_test_file(node.file_path, gap_root))
+        and node.name not in _TEST_GAP_EXEMPT_NAMES
+    ]
+    # TESTED_BY edges are stored as source=production, target=test by the
+    # parser, so a changed production function finds its tests by source.
+    # See: #515
+    directly_tested = store.get_directly_tested(
+        node.qualified_name for node in gap_candidates
+    )
+    # A private helper that no test names by hand is still run by the tests of
+    # the public function calling it, and calling it flatly "untested" is a
+    # false alarm the author cannot act on (#1047). Walk up the CALLS graph to
+    # find such a caller. The answer is a pointer, never a suppression and
+    # never a discount: the symbol keeps its full untested risk score and its
+    # place in the gap list, and only gains a note saying where a test already
+    # runs nearby. A static path is not execution -- see
+    # ``get_caller_test_routes`` for the coverage measurement behind that.
+    caller_routes = store.get_caller_test_routes(
+        (
+            node.qualified_name for node in gap_candidates
+            if node.qualified_name not in directly_tested
+        ),
+        repo_root=gap_root,
+    )
 
     # Compute per-node risk scores.
     node_risks: list[dict[str, Any]] = []
@@ -628,74 +829,117 @@ def analyze_changes(
     # Affected flows.
     affected = get_affected_flows(store, changed_files)
 
-    # Detect test gaps: changed functions without TESTED_BY edges.
+    # Label each gap with the two claims a reader has to tell apart: no tested
+    # caller was found anywhere near this symbol, versus one reaches it but
+    # only through a caller. Both stay in one list in node order, and
+    # ``indirect_gaps`` is only a view for the summary.
     #
-    # Stored file paths are absolute, so test-ness is judged against the path
-    # relative to the repository root: reading ``tests/`` out of an absolute
-    # path would also match a directory above the checkout, and a repository
-    # cloned into a CI workspace named "test" would report no gaps at all
-    # (issue #1023). ``repo_root`` is the caller's; the graph's own recorded
-    # root covers callers that pass none.
-    gap_root = repo_root or store.get_repo_root()
+    # The order is deliberately class-blind. Sorting the reached ones last
+    # looks prudent -- keep the "real" gaps when the list is truncated -- but
+    # every consumer bounds this list, so it made the weaker class the
+    # guaranteed first casualty: at ``detect_changes_tool``'s default of 25
+    # rows, a delta with 73 unreached gaps shipped zero reached ones while
+    # still reporting a count of 9, and a consumer deriving its own "tested"
+    # column from the truncated list then labelled those symbols as having
+    # their own tests. A class must not be announced in the counts and
+    # withheld from the payload.
     test_gaps: list[dict[str, Any]] = []
-    for node in changed_funcs:
-        # A symbol that lives in a test file is test code and can never be a
-        # gap in production test coverage. The path is checked as well as the
-        # stored flag so a graph built before the parser marked non-function
-        # test nodes still gives the right answer: those rows carry
-        # ``is_test = 0`` and used to be reported back to the author as their
-        # own tests needing tests (issue #1014).
-        if node.is_test or is_test_file(node.file_path, gap_root):
+    indirect_gaps: list[dict[str, Any]] = []
+    for node in gap_candidates:
+        if node.qualified_name in directly_tested:
             continue
-        if node.name in _TEST_GAP_EXEMPT_NAMES:
-            continue
-        # TESTED_BY edges are stored as source=production, target=test by the
-        # parser, so a changed production function finds its tests by source.
-        # See: #515
-        tested = store.get_edges_by_source(node.qualified_name)
-        if not any(e.kind == "TESTED_BY" for e in tested):
-            test_gaps.append({
-                "name": _sanitize_name(node.name),
-                "qualified_name": _sanitize_name(node.qualified_name),
-                "file": node.file_path,
-                "line_start": node.line_start,
-                "line_end": node.line_end,
-            })
+        entry: dict[str, Any] = {
+            "name": _sanitize_name(node.name),
+            "qualified_name": _sanitize_name(node.qualified_name),
+            "file": node.file_path,
+            "line_start": node.line_start,
+            "line_end": node.line_end,
+        }
+        route = caller_routes.get(node.qualified_name)
+        if route is None:
+            entry["coverage"] = "none"
+        else:
+            entry["coverage"] = "indirect"
+            entry["covered_via"] = _sanitize_name(str(route["via"]))
+            entry["covered_depth"] = route["depth"]
+            # One test names the route; three cost triple the payload for a
+            # reader who opens the first one anyway.
+            entry["covered_by"] = [
+                _sanitize_name(str(t)) for t in route["tests"][:1]
+            ]
+            indirect_gaps.append(entry)
+        test_gaps.append(entry)
+    indirect_count = len(indirect_gaps)
+    uncovered_count = len(test_gaps) - indirect_count
 
     # Review priorities: top 10 by risk score.
     review_priorities = sorted(node_risks, key=lambda x: x["risk_score"], reverse=True)[:10]
 
     # Build summary.
+    # "no direct test", not "no test in reach": the graph sees TESTED_BY edges
+    # and CALLS paths, not the suite. On the very delta of #1047 two symbols in
+    # the unreached group (auto_promote.py::cmd_verify and
+    # ::ForeignPullRequestError) are exercised by tests that load the script
+    # through importlib, so no edge records it. The weaker claim is true; the
+    # stronger one is not ours to make.
+    gap_line = f"  - {len(test_gaps)} test gap(s)"
+    if indirect_count:
+        gap_line += (
+            f" ({uncovered_count} with no tested caller found, "
+            f"{indirect_count} reached only through a caller)"
+        )
     summary_parts = [
         f"Analyzed {len(changed_files)} changed file(s):",
         f"  - {len(changed_funcs)} changed function(s)/class(es)",
         f"  - {affected['total']} affected flow(s)",
-        f"  - {len(test_gaps)} test gap(s)",
+        gap_line,
         f"  - Overall risk score: {overall_risk:.2f}",
     ]
-    if test_gaps:
-        # Dedup by bare name in the human summary. The underlying test_gaps
-        # list keeps every entry (a downstream consumer needs precision via
-        # qualified_name), but a graph that ended up with the same function
-        # stored under two qualified_names (e.g. relative + absolute path
-        # variants) would otherwise print "X, X, Y, Y" — surfacing graph
-        # corruption as a UX bug. The root cause is path normalization;
-        # this is the defensive last line.
+
+    # Dedup by bare name in the human summary. The underlying test_gaps list
+    # keeps every entry (a downstream consumer needs precision via
+    # qualified_name), but a graph that ended up with the same function
+    # stored under two qualified_names (e.g. relative + absolute path
+    # variants) would otherwise print "X, X, Y, Y" — surfacing graph
+    # corruption as a UX bug. The root cause is path normalization;
+    # this is the defensive last line.
+    def _gap_names(entries: list[dict[str, Any]], limit: int = 5) -> list[str]:
         seen_names: set[str] = set()
-        gap_names: list[str] = []
-        for g in test_gaps:
+        names: list[str] = []
+        for g in entries:
             n = g["name"]
             if n in seen_names:
                 continue
             seen_names.add(n)
-            gap_names.append(n)
-            if len(gap_names) >= 5:
+            names.append(n)
+            if len(names) >= limit:
                 break
-        summary_parts.append(f"  - Untested: {', '.join(gap_names)}")
+        return names
+
+    if uncovered_count:
+        # Filtered by class, not sliced: the list is in node order, so the
+        # two classes are interleaved.
+        unreached_gaps = [g for g in test_gaps if g["coverage"] != "indirect"]
+        summary_parts.append(
+            f"  - Untested: {', '.join(_gap_names(unreached_gaps))}"
+        )
+    if indirect_count:
+        # Named separately, because acting on the two lists differs: these
+        # symbols already run under a test and need an assertion of their own,
+        # not a test written from nothing.
+        summary_parts.append(
+            "  - Reached only through a caller: "
+            f"{', '.join(_gap_names(indirect_gaps))}"
+        )
     if funcs_truncated:
         summary_parts.append(
             f"  - Warning: analysis capped at {_max_funcs} functions "
             f"(set CRG_MAX_CHANGED_FUNCS to adjust)"
+        )
+    if ranges_unavailable:
+        summary_parts.append(
+            "  - Warning: line-level diff unavailable, whole files scored "
+            f"({ranges_unavailable})"
         )
     if churn_status == CHURN_UNAVAILABLE:
         # Say it in the summary, not only in a log line nobody reads: the
@@ -714,7 +958,16 @@ def analyze_changes(
         "changed_functions": node_risks,
         "affected_flows": affected["affected_flows"],
         "test_gaps": test_gaps,
+        # Counts, not just the list: every consumer bounds ``test_gaps``, and
+        # both the total and the split between "no tested caller found" and
+        # "reached through a caller" must survive that truncation. A renderer
+        # that takes its headline from ``len(test_gaps)`` but its split from
+        # these prints a total that does not equal its own parts.
+        "test_gaps_total": len(test_gaps),
+        "test_gaps_uncovered": uncovered_count,
+        "test_gaps_indirect": indirect_count,
         "review_priorities": review_priorities,
         "functions_truncated": funcs_truncated,
+        "diff_ranges_unavailable": ranges_unavailable,
         "churn_status": churn_status,
     }

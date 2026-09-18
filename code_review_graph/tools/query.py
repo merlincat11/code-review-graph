@@ -8,8 +8,10 @@ from pathlib import Path
 from typing import Any
 
 from ..config_keys import normalize_spring_config_key
+from ..constants import IMPORT_SCOPE_KEY
 from ..context_savings import attach_context_savings, estimate_file_tokens
 from ..embeddings import EmbeddingStore
+from ..errors import ChangeDiscoveryError
 from ..graph import (
     IMPACT_RESOLUTIONS,
     QUERY_RESOLUTIONS,
@@ -22,14 +24,13 @@ from ..graph import (
     _compatible_edge_languages,
     _sanitize_name,
     edge_to_dict,
+    import_scope_ancestors,
     node_to_dict,
 )
 from ..hints import generate_hints, get_session
 from ..incremental import (
-    get_changed_files,
+    discover_review_changes,
     get_db_path,
-    get_staged_and_unstaged,
-    resolve_review_base,
 )
 from ..parser import normalize_file_path
 from ..search import hybrid_search
@@ -38,9 +39,28 @@ from ..uncertainty import (
     empty_query_confidence,
     empty_search_confidence,
 )
-from ._common import _BUILTIN_CALL_NAMES, _get_store, _resolve_graph_file_paths
+from ._common import (
+    _BUILTIN_CALL_NAMES,
+    _bounded,
+    _error_response,
+    _get_store,
+    _resolve_graph_file_paths,
+)
 
 logger = logging.getLogger(__name__)
+
+# Hard ceilings for the impact response, so its size is a constant rather
+# than a function of the repository. ``edges`` and ``changed_nodes`` had no
+# ceiling at all, and ``max_results`` is not exposed on the MCP tool, so a
+# single changed file of cli/cli returned 1,361 connecting edges and one of
+# kubernetes returned 500 impacted nodes -- 138k and 189k tokens against a
+# documented 12k budget for this tool. The numbers are ``get_review_context``'s
+# own, because it caps the same three lists of the same radius for the same
+# reason. ``total_impacted``, ``nodes_omitted``, ``edges_omitted`` and
+# ``changed_nodes_omitted`` still report the full counts.
+_MAX_IMPACT_NODES_SHOWN = 100
+_MAX_IMPACT_EDGES = 150
+_MAX_IMPACT_FILES = 200
 
 # ---------------------------------------------------------------------------
 # Tool 2: get_impact_radius
@@ -221,10 +241,7 @@ def get_impact_radius(
     store, root = _get_store(repo_root)
     try:
         if changed_files is None:
-            base = resolve_review_base(root, base)
-            changed_files = get_changed_files(root, base)
-            if not changed_files:
-                changed_files = get_staged_and_unstaged(root)
+            changed_files, base = discover_review_changes(root, base)
 
         if not changed_files:
             return {
@@ -261,7 +278,10 @@ def get_impact_radius(
             ):
                 direct_sites.setdefault(edge.source_qualified, []).append(edge)
         impacted_dicts = []
-        for node in result["impacted_nodes"]:
+        shown_impacted, _total_shown, _cut = _bounded(
+            result["impacted_nodes"], max_results, _MAX_IMPACT_NODES_SHOWN,
+        )
+        for node in shown_impacted:
             node_dict = node_to_dict(node)
             score = impact_scores.get(node.qualified_name)
             if score is not None:
@@ -276,26 +296,61 @@ def get_impact_radius(
                 if len(node_sites) > 1:
                     node_dict["call_site_count"] = len(node_sites)
             impacted_dicts.append(node_dict)
-        edge_dicts = [edge_to_dict(e) for e in result["edges"]]
+        # Edges that touch the changed code are kept first: a truncated list
+        # has to keep the part that explains the radius rather than whichever
+        # rows happened to sort first.
+        ordered_edges = sorted(
+            result["edges"],
+            key=lambda e: (
+                e.source_qualified not in changed_qns
+                and e.target_qualified not in changed_qns,
+            ),
+        )
+        shown_edges, edges_total, _edges_cut = _bounded(
+            ordered_edges, max_results, _MAX_IMPACT_EDGES,
+        )
+        edge_dicts = [edge_to_dict(e) for e in shown_edges]
+        edges_omitted = edges_total - len(edge_dicts)
+        changed_dicts, changed_total, _cn_cut = _bounded(
+            changed_dicts, max_results, _MAX_IMPACT_NODES_SHOWN,
+        )
+        changed_nodes_omitted = changed_total - len(changed_dicts)
+        shown_files, files_total, _files_cut = _bounded(
+            result["impacted_files"], max_results, _MAX_IMPACT_FILES,
+        )
+        files_omitted = files_total - len(shown_files)
         # The traversal joins qualified names, so a call site that only ever
         # names the changed symbol is unreachable and silently absent above.
         # Counting it is what stops an empty-looking radius reading as proof.
         unresolved_call_sites = store.count_unresolved_call_sites({
             n.name for n in result["changed_nodes"] if n.kind != "File"
         })
-        truncated = result["truncated"]
+        # ``truncated`` has to mean "there is more", whichever cap bit.
+        truncated = (
+            result["truncated"]
+            or len(impacted_dicts) < len(result["impacted_nodes"])
+            or edges_omitted > 0
+            or changed_nodes_omitted > 0
+            or files_omitted > 0
+        )
         total_impacted = result["total_impacted"]
 
         summary_parts = [
             f"Blast radius for {len(changed_files)} changed file(s):",
-            f"  - {len(changed_dicts)} nodes directly changed",
-            f"  - {len(impacted_dicts)} nodes impacted (within {max_depth} hops)",
-            f"  - {len(result['impacted_files'])} additional files affected",
+            f"  - {len(result['changed_nodes'])} nodes directly changed",
+            f"  - {total_impacted} nodes impacted (within {max_depth} hops)",
+            f"  - {files_total} additional files affected",
         ]
-        if truncated:
+        if len(impacted_dicts) < total_impacted:
             summary_parts.append(
                 f"  - Results truncated: showing {len(impacted_dicts)}"
                 f" of {total_impacted} impacted nodes"
+            )
+        if edges_omitted or changed_nodes_omitted or files_omitted:
+            summary_parts.append(
+                f"  - Also truncated: {edges_omitted} edges,"
+                f" {changed_nodes_omitted} changed nodes,"
+                f" {files_omitted} impacted files omitted"
             )
 
         # "Nothing is impacted" and "nothing about these files is indexed"
@@ -310,7 +365,9 @@ def get_impact_radius(
             )
 
         if detail_level == "minimal":
-            impacted_count = len(impacted_dicts)
+            # The full count, not the displayed one: the risk band must not
+            # change because a display cap trimmed the list.
+            impacted_count = total_impacted
             if impacted_count > 20:
                 risk = "high"
             elif impacted_count > 5:
@@ -342,9 +399,12 @@ def get_impact_radius(
             "summary": "\n".join(summary_parts),
             "changed_files": changed_files,
             "changed_nodes": changed_dicts,
+            "changed_nodes_omitted": changed_nodes_omitted,
             "impacted_nodes": impacted_dicts,
-            "impacted_files": result["impacted_files"],
+            "impacted_files": shown_files,
+            "impacted_files_omitted": files_omitted,
             "edges": edge_dicts,
+            "edges_omitted": edges_omitted,
             "truncated": truncated,
             "total_impacted": total_impacted,
             "nodes_omitted": max(0, total_impacted - len(impacted_dicts)),
@@ -355,6 +415,12 @@ def get_impact_radius(
             response["confidence"] = confidence
         attach_context_savings(response, original_tokens=original_tokens)
         return response
+    except ChangeDiscoveryError as exc:
+        # Distinct from the "no changed files" answer above, and deliberately
+        # so: that one is an all-clear a client will act on. Git that could
+        # not be run, or that overran the discovery budget, says nothing
+        # about the working tree (#262).
+        return _error_response(str(exc))
     finally:
         store.close()
 
@@ -727,7 +793,14 @@ def query_graph(
         elif pattern == "imports_of":
             for e in store.iter_edges_by_source(qn):
                 if e.kind == "IMPORTS_FROM":
-                    add_result({"import_target": e.target_qualified}, e)
+                    row: dict[str, Any] = {"import_target": e.target_qualified}
+                    scope = e.extra.get(IMPORT_SCOPE_KEY)
+                    if scope:
+                        # The target is a directory, not a file: say so
+                        # rather than let a reader take it for a path that
+                        # should have a node.
+                        row["import_target_kind"] = scope
+                    add_result(row, e)
 
         elif pattern == "importers_of":
             # Find edges where target matches this file.
@@ -746,6 +819,25 @@ def query_graph(
                     add_result({
                         "importer": e.source_qualified,
                         "file": e.file_path,
+                    }, e)
+            # A Go import names a package and a Ruby ``require_all`` names a
+            # tree, so those edges target a DIRECTORY. One edge per import
+            # rather than one per file in the package is what keeps the graph
+            # linear in imports; expanding the directory here is the other
+            # half of that trade. See IMPORT_SCOPE_KEY in constants.py.
+            for directory, scopes in import_scope_ancestors(abs_target):
+                for e in store.iter_edges_by_target(directory):
+                    if e.kind != "IMPORTS_FROM":
+                        continue
+                    if e.extra.get(IMPORT_SCOPE_KEY) not in scopes:
+                        continue
+                    if e.source_qualified in seen_importers:
+                        continue
+                    seen_importers.add(e.source_qualified)
+                    add_result({
+                        "importer": e.source_qualified,
+                        "file": e.file_path,
+                        "via_package": directory,
                     }, e)
             # C# fallback: `using X.Y;` directives produce IMPORTS_FROM edges
             # whose target is the raw namespace string, not a file path, so

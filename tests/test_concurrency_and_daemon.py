@@ -13,14 +13,19 @@ What protects cross-process access today, verified rather than assumed:
   each file in a ``BEGIN IMMEDIATE`` transaction. That is the *whole* of it.
 * ``threading.Lock`` in ``GraphStore`` guards the in-memory NetworkX cache
   only. It is a thread lock; it does nothing across processes.
-* There is no lock file, no ``flock``, no advisory lock, no "build in
-  progress" marker. Nothing serialises two ``code-review-graph`` processes,
-  and nothing tells a second one that a first is already running.
+* Nothing serialises two ``code-review-graph`` processes against the graph
+  itself: no lock file next to ``graph.db``, no advisory lock on it, and no
+  handshake that tells a second process a first is already writing.
 
-So the guarantee is exactly SQLite's: single writer, five-second wait, then an
-error. The tests below pin what that does and does not buy, and the ones marked
-``xfail(strict=True)`` pin the gaps — they flip to a failure the day the gap is
-closed, which is the point.
+So the guarantee on the database is exactly SQLite's: single writer,
+five-second wait, then an error. What is layered on top of it is recovery
+rather than exclusion — a ``build_state`` metadata row that marks a build
+half-finished until post-processing ends, and a write that fails stopping the
+build before the VCS anchor claims the graph is current. The daemon does hold
+one exclusive lock, on its PID file in ``$CRG_HOME``, purely so a recycled PID
+cannot be mistaken for it.
+
+The tests below pin what all of that does and does not buy.
 
 Run them::
 
@@ -256,6 +261,18 @@ def _metadata(db: Path, key: str) -> str | None:
         conn.close()
 
 
+def _set_metadata(db: Path, key: str, value: str) -> None:
+    """Put the graph into a chosen state, the way a crashed run would leave it."""
+    conn = _open_readonly(db)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", (key, value)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _wait_for(predicate, timeout: float = _SETTLE, interval: float = 0.25) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -428,14 +445,18 @@ class TestConcurrentAccess:
         # cache. It is invisible to any other process by construction.
         assert isinstance(store._cache_lock, type(threading.Lock()))
 
-    def test_blocked_writer_fails_with_a_raw_sqlite_error(self, tmp_path: Path) -> None:
-        """A writer that waits out busy_timeout gets a traceback, not a message.
+    def test_blocked_writer_fails_fast_and_keeps_the_raw_cause(
+        self, tmp_path: Path
+    ) -> None:
+        """A writer that waits out busy_timeout stops, and says why.
 
-        This asserts today's behaviour deliberately. The contract a CLI owes
-        its user is "another process is using this graph, retry" — what it
-        actually prints is ``sqlite3.OperationalError: database is locked``
-        under twenty lines of internal stack. The companion xfail below states
-        the contract.
+        The decision the CLI makes here is "fail loudly", not "wait" or
+        "retry": ``build`` and ``update`` run from commit and editor hooks
+        where an unbounded wait reads as a hang, and there is nothing to
+        salvage by waiting longer — a build that stops writes no anchor, so
+        the next run rebuilds. This pins the timing (one busy_timeout, not a
+        retry ladder) and that the underlying SQLite message survives into
+        stderr for anyone diagnosing it.
         """
         home = tmp_path / "home"
         repo = _make_repo(tmp_path / "repo", 24)
@@ -453,20 +474,7 @@ class TestConcurrentAccess:
         assert 3.0 < waited < 25.0, f"no real contention window: waited {waited:.1f}s"
         assert blocked.returncode != 0
         assert "database is locked" in blocked.stderr
-        assert "Traceback (most recent call last)" in blocked.stderr, (
-            "if this stops being a traceback the error handling changed; "
-            "update the xfail companion below"
-        )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "BUG: a writer blocked by another process dies with a raw "
-            "sqlite3.OperationalError traceback. Nothing in cli.py, "
-            "tools/build.py or graph.py catches it, so the user sees SQLite "
-            "internals instead of 'another process is updating this graph'."
-        ),
-    )
     def test_blocked_writer_should_explain_itself(self, tmp_path: Path) -> None:
         home = tmp_path / "home"
         repo = _make_repo(tmp_path / "repo", 24)
@@ -513,19 +521,21 @@ class TestConcurrentAccess:
         assert _integrity(_db_path(repo)) == "ok"
         assert _fts_integrity(_db_path(repo)) == "ok"
 
-    def test_serial_build_under_contention_silently_drops_files(
+    def test_serial_build_under_contention_is_repaired_by_the_next_run(
         self, tmp_path: Path
     ) -> None:
-        """Today's behaviour on the serial path, and the worst finding here.
+        """The serial path's recovery, which used to be impossible.
 
-        ``full_build``'s serial loop wraps each file in ``except Exception``
-        and records the failure as ``{"file": ..., "error": ...}``. A
-        ``database is locked`` from the *store* call lands in that handler and
-        is reported as if the file failed to parse. The build then keeps
-        going, writes ``last_updated`` and ``git_head_sha`` as though it had
-        indexed everything, and exits 0. The locked-out files are simply not
-        in the graph, and because the anchor says the graph is current, no
-        later ``update`` brings them back.
+        ``full_build``'s serial loop wraps each file's *parse* in ``except
+        Exception``; a ``database is locked`` from the *store* call used to
+        land in that handler too and be reported as a parse error. The build
+        kept going, wrote ``last_updated`` and ``git_head_sha`` as though it
+        had indexed everything, and exited 0 — so the locked-out files were
+        gone for good, the anchor telling every later ``update`` that the
+        graph was current.
+
+        Now the write is outside the parse handlers: it stops the build, no
+        anchor is written, and a later run reconstructs the whole graph.
 
         The serial loop is not an exotic path: it is what every repository of
         fewer than 8 files uses, and what ``CRG_SERIAL_PARSE=1`` selects.
@@ -538,37 +548,26 @@ class TestConcurrentAccess:
         with _LockHeld(_db_path(repo), 25.0, env):
             build = _crg("build", "--repo", str(repo), env=env)
 
-        # Canary: contention really happened, and really was misreported.
-        assert "database is locked" in build.stdout + build.stderr
-        assert "Error parsing" in build.stdout + build.stderr
+        # Canary: contention really happened, and was not mistaken for a
+        # parse failure this time.
+        combined = build.stdout + build.stderr
+        assert "database is locked" in combined
+        assert "Error parsing" not in combined, combined[-2000:]
 
-        assert build.returncode == 0, "a build that lost files exited successfully"
+        assert build.returncode != 0, "a build that lost files exited successfully"
         db = _db_path(repo)
-        counts = _counts(db)
-        assert 0 < counts["files"] < 12, counts
-        assert _metadata(db, "git_head_sha") is not None, (
+        assert _metadata(db, "git_head_sha") is None, (
             "the anchor was written despite the missing files"
         )
 
-        # And the damage is permanent: the anchor makes the next update a
-        # no-op, so the dropped files never return.
+        # And the damage is repairable: with no anchor the next update is
+        # promoted to a full rebuild.
         update = _crg("update", "--repo", str(repo), env=env)
-        assert update.returncode == 0
-        assert "0 files updated" in update.stdout
-        assert _counts(db)["files"] == counts["files"], "unexpectedly repaired"
+        assert update.returncode == 0, update.stderr
+        assert _counts(db)["files"] == 12
+        assert _integrity(db) == "ok"
+        assert _fts_integrity(db) == "ok"
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "BUG: full_build's serial loop catches Exception per file, so a "
-            "'database is locked' from store_file_nodes_edges is filed as a "
-            "parse error. The build exits 0, writes git_head_sha as if "
-            "complete, and the files it never stored are gone for good — the "
-            "next update sees a current anchor and reports 'No changes "
-            "detected'. Two shipped writers (the daemon watcher and the "
-            "PostToolUse hook) make this reachable without any user error."
-        ),
-    )
     def test_serial_build_under_contention_should_not_lose_files(
         self, tmp_path: Path
     ) -> None:
@@ -670,18 +669,21 @@ class TestConcurrentAccess:
         assert reads["n"] >= 2, f"reader only managed {reads['n']} query(ies)"
         assert failures == [], failures[0]
 
-    def test_get_stats_reads_are_not_snapshot_isolated(self, tmp_path: Path) -> None:
-        """A commit landing mid-``get_stats`` yields self-contradicting numbers.
+    def test_get_stats_holds_one_snapshot_across_its_statements(
+        self, tmp_path: Path
+    ) -> None:
+        """A commit landing mid-``get_stats`` is invisible to the rest of it.
 
-        ``GraphStore`` opens with ``isolation_level=None`` and reads outside
-        any transaction, so each statement gets its own snapshot.
-        ``get_stats`` issues six. A writer committing between the first and
-        the second — exactly what a watcher does while ``code-review-graph
-        status`` runs — makes ``total_nodes`` disagree with the per-kind
-        breakdown that is supposed to sum to it.
+        ``GraphStore`` opens with ``isolation_level=None``, so without a read
+        transaction each of ``get_stats``' six statements would get its own
+        snapshot, and a writer committing between two of them — exactly what a
+        watcher does while ``code-review-graph status`` runs — would make
+        ``total_nodes`` disagree with the per-kind breakdown that is supposed
+        to sum to it.
 
-        The interleave is forced here rather than raced for, but the window it
-        forces is the real one: nothing in the read path holds it shut.
+        The interleave is forced here rather than raced for, and it fires
+        after the first read has pinned the snapshot, so every later statement
+        must still see the pre-commit graph.
         """
         db = tmp_path / "graph.db"
         store = GraphStore(db)
@@ -702,35 +704,38 @@ class TestConcurrentAccess:
 
             writer = sqlite3.connect(str(db), timeout=30, isolation_level=None)
             writer.execute("PRAGMA busy_timeout=5000")
+            fired = {"n": 0}
+
+            def _delete() -> None:
+                fired["n"] += 1
+                writer.execute("DELETE FROM nodes WHERE file_path LIKE 'src/mod1%'")
+
             try:
                 store._conn = _InterleavingConnection(
                     store._conn,
-                    after_statement=1,
-                    action=lambda: writer.execute(
-                        "DELETE FROM nodes WHERE file_path LIKE 'src/mod1%'"
-                    ),
+                    # 1 = BEGIN DEFERRED, 2 = the first COUNT, which pins the
+                    # snapshot; the delete lands before statement 3.
+                    after_statement=2,
+                    action=_delete,
                 )
-                torn = store.get_stats()
+                during = store.get_stats()
             finally:
                 writer.close()
         finally:
             store.close()
 
-        assert sum(torn.nodes_by_kind.values()) != torn.total_nodes, (
-            "expected a torn read: total_nodes came from before the commit and "
-            "nodes_by_kind from after"
+        # Canary: the concurrent delete really was committed mid-read.
+        assert fired["n"] == 1
+        assert sum(during.nodes_by_kind.values()) == during.total_nodes == 40, (
+            "a commit landing mid-read leaked into the later statements"
         )
+        # And it really happened: a fresh read sees the smaller graph.
+        after = GraphStore(db)
+        try:
+            assert after.get_stats().total_nodes == 18
+        finally:
+            after.close()
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "BUG: GraphStore reads are not wrapped in a read transaction, so a "
-            "multi-statement read such as get_stats (6 statements) can mix "
-            "before-commit and after-commit snapshots. `code-review-graph "
-            "status` can print totals that do not add up while a watcher "
-            "writes."
-        ),
-    )
     def test_get_stats_should_be_internally_consistent(self, tmp_path: Path) -> None:
         db = tmp_path / "graph.db"
         store = GraphStore(db)
@@ -763,18 +768,6 @@ class TestConcurrentAccess:
 
         assert sum(stats.nodes_by_kind.values()) == stats.total_nodes
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "BUG: run_migrations does check-then-act (_has_column / "
-            "_table_exists, then ALTER/CREATE) outside any transaction, and "
-            "the connection is opened with isolation_level=None. Two "
-            "processes opening the same fresh database concurrently — a "
-            "watcher and a hook, a daemon and a build — can both see the "
-            "column missing; the loser dies with 'duplicate column name: "
-            "signature' out of GraphStore.__init__."
-        ),
-    )
     def test_concurrent_first_open_should_not_race_in_migrations(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -786,14 +779,19 @@ class TestConcurrentAccess:
         """
         db = tmp_path / "graph.db"
         # A v1 database: schema in place, every migration still pending.
+        # parent_name and extra are in the base CREATE TABLE and no migration
+        # adds them, so a real v1 database carries both; the backfills from v13
+        # on read them, and a seed without them would fail for that reason
+        # rather than for the race this test is about.
         seed = sqlite3.connect(str(db))
         seed.executescript(
             "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
             "CREATE TABLE nodes (id INTEGER PRIMARY KEY, kind TEXT, name TEXT,"
-            " qualified_name TEXT UNIQUE, file_path TEXT, updated_at REAL);"
+            " qualified_name TEXT UNIQUE, file_path TEXT, parent_name TEXT,"
+            " extra TEXT DEFAULT '{}', updated_at REAL);"
             "CREATE TABLE edges (id INTEGER PRIMARY KEY, kind TEXT,"
             " source_qualified TEXT, target_qualified TEXT, file_path TEXT,"
-            " updated_at REAL);"
+            " extra TEXT DEFAULT '{}', updated_at REAL);"
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '1');"
         )
         seed.commit()
@@ -1162,15 +1160,18 @@ class TestInterruption:
         assert repaired.returncode == 0, repaired.stderr
         assert _counts(db)["fts_hits"] > 0
 
-    def test_kill_after_the_anchor_leaves_a_graph_that_claims_to_be_complete(
+    def test_kill_after_the_anchor_is_visible_as_an_incomplete_build(
         self, tmp_path: Path
     ) -> None:
-        """Today's behaviour: postprocess never ran, and nothing says so.
+        """A half-built graph now says so, instead of looking healthy.
 
-        ``full_build`` stores ``last_updated`` and ``git_head_sha`` before
-        post-processing. A kill in that window leaves every node in place, the
-        anchor current, an empty FTS index and no flows — and ``status``
-        prints a healthy graph.
+        ``full_build`` stores ``last_updated`` and ``git_head_sha`` as soon as
+        the last file is stored. A kill between that and post-processing
+        leaves every node in place, the anchor current, an empty FTS index and
+        no flows — a state freshness metadata cannot express, which is why
+        ``status`` used to print a perfectly healthy graph. The build-state
+        marker, written first and cleared last, is the evidence that it is
+        not.
         """
         home = tmp_path / "home"
         repo = _make_repo(tmp_path / "repo", 24)
@@ -1187,24 +1188,17 @@ class TestInterruption:
         assert _metadata(db, "git_head_sha") is not None
         assert counts["fts_hits"] == 0
         assert counts["flows"] == 0
+        # Every file was stored, so the marker records the narrower failure:
+        # derived data outstanding, not files missing. Which one it is decides
+        # whether a hand repair can finish the graph.
+        assert _metadata(db, "build_state") == "postprocess-pending"
 
         status = _crg("status", "--repo", str(repo), env=env)
         assert status.returncode == 0
         assert "Nodes: 96" in status.stdout
-        assert "partial" not in status.stdout.lower()
-        assert "incomplete" not in status.stdout.lower()
+        assert "INCOMPLETE" in status.stdout
+        assert "update" in status.stdout
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "BUG: full_build writes last_updated/git_head_sha *before* "
-            "post-processing, and build_or_update_graph returns early on "
-            "'No changes detected' without running post-processing. A build "
-            "killed in that window leaves an empty FTS index and no flows "
-            "forever: the next `update` reports the graph up to date and "
-            "repairs nothing. Search silently degrades to a LIKE scan."
-        ),
-    )
     def test_next_run_should_repair_a_build_killed_before_postprocessing(
         self, tmp_path: Path
     ) -> None:
@@ -1221,6 +1215,89 @@ class TestInterruption:
         after = _counts(db)
         assert after["fts_hits"] > 0, "FTS index still empty after update"
         assert after["flows"] > 0, "flows still missing after update"
+
+    def test_a_hand_repair_of_a_stored_graph_clears_the_marker(
+        self, tmp_path: Path
+    ) -> None:
+        """``postprocess`` finishes the build it can finish, and says so.
+
+        Killed after the last file was stored, the graph's contents are whole
+        and only the derived data is missing. That is the one state
+        ``code-review-graph postprocess`` exists to repair. Clearing the
+        marker afterwards is not a courtesy: leaving it set would promote
+        every later update to a full rebuild of a graph that is already right.
+        """
+        home = tmp_path / "home"
+        repo = _make_repo(tmp_path / "repo", 24)
+        env = _isolated_env(home, serial=True)
+
+        _kill_during_build("after_anchor", repo, env)
+        db = _db_path(repo)
+        counts = _counts(db)
+        # Canaries: every file landed, and the derived data really is missing,
+        # so the repair below repairs something.
+        assert counts["files"] == 24
+        assert counts["nodes"] == 24 * 4
+        assert counts["fts_hits"] == 0
+        # The marker distinguishes this from a build that never stored the
+        # graph, which is what makes the repair below legitimate.
+        assert _metadata(db, "build_state") == "postprocess-pending"
+
+        repaired = _crg("postprocess", "--repo", str(repo), env=env)
+        assert repaired.returncode == 0, repaired.stderr
+        after = _counts(db)
+        assert after["fts_hits"] > 0, "FTS index still empty after postprocess"
+        assert after["flows"] > 0, "flows still missing after postprocess"
+        assert _metadata(db, "build_state") == "complete", (
+            "a genuine repair could not clear the marker it exists to clear"
+        )
+
+        status = _crg("status", "--repo", str(repo), env=env)
+        assert "INCOMPLETE" not in status.stdout
+
+    def test_postprocess_cannot_clear_a_build_that_never_stored_the_graph(
+        self, tmp_path: Path
+    ) -> None:
+        """The other direction: derived data over missing files is not health.
+
+        Killed mid-parse, the graph holds a handful of files out of 24. Every
+        post-processing stage reads the stored nodes, so all of them succeed
+        and none of them can notice: flows, communities and a search index get
+        rebuilt, correctly, for a graph that is missing most of the
+        repository. Clearing the marker there hands back a half-built graph
+        labelled healthy, which is the exact failure the marker was added to
+        prevent, reached from the repair side.
+        """
+        home = tmp_path / "home"
+        repo = _make_repo(tmp_path / "repo", 24)
+        env = _isolated_env(home, serial=True)
+
+        _kill_during_build("parse", repo, env)
+        db = _db_path(repo)
+        partial = _counts(db)
+        # Canary: it stored something, and it is genuinely short of the repo.
+        assert partial["nodes"] > 0
+        assert 0 < partial["files"] < 24
+        assert _metadata(db, "build_state") == "in-progress"
+
+        ran = _crg("postprocess", "--repo", str(repo), env=env)
+        assert ran.returncode == 0, ran.stderr
+        assert _metadata(db, "build_state") == "in-progress", (
+            "postprocess declared a graph with missing files complete"
+        )
+        # And it is not reported as a repair that worked.
+        assert "INCOMPLETE" in ran.stdout, ran.stdout
+
+        # The graph still says what it is, and the repair that works is still
+        # the one offered.
+        status = _crg("status", "--repo", str(repo), env=env)
+        assert "INCOMPLETE" in status.stdout
+        assert _counts(db)["files"] < 24
+
+        rebuilt = _crg("build", "--repo", str(repo), env=env)
+        assert rebuilt.returncode == 0, rebuilt.stderr
+        assert _counts(db)["files"] == 24
+        assert _metadata(db, "build_state") == "complete"
 
 
 # ---------------------------------------------------------------------------
@@ -1323,15 +1400,17 @@ class TestDaemonLifecycle:
         assert daemon_mod.is_daemon_running(pid_file) is False
         assert not pid_file.exists(), "a stale PID file was left on disk"
 
-    def test_recycled_pid_makes_the_cli_adopt_an_unrelated_process(
+    def test_recycled_pid_is_not_mistaken_for_the_daemon(
         self, tmp_path: Path
     ) -> None:
-        """Today's behaviour: any live PID in the file reads as 'the daemon'.
+        """A live PID in the file is no longer enough to read as 'the daemon'.
 
-        ``is_daemon_running`` asks only whether *a* process with that PID
-        exists. PIDs are recycled, so after a reboot or a wrap-around the file
-        can name something else entirely. ``start`` then refuses to run, and
-        ``stop`` signals the stranger.
+        ``is_daemon_running`` used to ask only whether *a* process with that
+        PID exists. PIDs are recycled, so after a reboot or a wrap-around the
+        file can name something else entirely; ``start`` then refused to run
+        and ``stop`` signalled the stranger. The daemon now also holds an
+        exclusive lock for its lifetime, which the kernel releases the moment
+        it dies, so a PID file with no lock behind it is stale by definition.
         """
         env = _isolated_env(tmp_path / "home")
         pid_file = Path(env["CRG_HOME"]) / "daemon.pid"
@@ -1342,31 +1421,19 @@ class TestDaemonLifecycle:
             pid_file.write_text(str(victim), encoding="utf-8")
 
             status = _daemon_cli("status", env=env)
-            assert f"running (PID {victim})" in status.stdout
-
-            start = _daemon_cli("start", env=env)
-            assert start.returncode == 1
-            assert "already running" in start.stdout
+            assert "not running" in status.stdout
+            assert str(victim) not in status.stdout
 
             stop = _daemon_cli("stop", env=env)
-            assert stop.returncode == 0, stop.stdout
-            assert "Daemon stopped." in stop.stdout
-            assert _wait_for(lambda: not _alive(victim), timeout=15), (
-                "expected the CLI to have killed the unrelated process"
-            )
+            assert stop.returncode == 1
+            assert "not running" in stop.stdout
+            assert _alive(victim), "the CLI signalled an unrelated process"
+
+            # And the stale file is cleared rather than blocking a start.
+            assert not pid_file.exists()
         finally:
             _reap([victim])
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "BUG: the PID file carries no identity. is_daemon_running() only "
-            "asks whether some process holds that PID, so a recycled PID makes "
-            "`crg-daemon start` refuse to start and `crg-daemon stop` SIGTERM "
-            "then SIGKILL an unrelated process. No cmdline check, no start-time "
-            "check, no exclusive lock on the file."
-        ),
-    )
     def test_recycled_pid_should_not_be_adopted(self, tmp_path: Path) -> None:
         env = _isolated_env(tmp_path / "home")
         pid_file = Path(env["CRG_HOME"]) / "daemon.pid"
@@ -1379,13 +1446,16 @@ class TestDaemonLifecycle:
         finally:
             _reap([victim])
 
-    def test_daemon_crash_orphans_its_watchers(self, tmp_path: Path, daemon_env) -> None:
-        """Today's behaviour, and the reason a second start doubles up.
+    def test_daemon_crash_leaves_watchers_that_status_and_start_handle(
+        self, tmp_path: Path, daemon_env
+    ) -> None:
+        """A crashed daemon's watchers are visible, reapable, and never doubled.
 
         SIGKILL the daemon — an OOM kill, a crash, ``kill -9`` — and its
-        watcher children survive. ``status`` then reports "not running" and
-        lists nothing, while a live watcher keeps writing the graph. ``stop``
-        exits 1 without touching it. A fresh ``start`` spawns a *second*
+        watcher children survive, because they are plain ``subprocess.Popen``
+        children in its session. ``status`` used to report "not running" and
+        list nothing while a live watcher kept writing the graph, ``stop``
+        exited 1 without touching it, and a fresh ``start`` spawned a *second*
         watcher for the same repository: two writers on one database, one of
         them invisible.
         """
@@ -1399,6 +1469,7 @@ class TestDaemonLifecycle:
         orphan = _child_pids(env)["r"]
         spawned.extend([pid, orphan])
         assert pid is not None and _alive(pid) and _alive(orphan)  # canary
+        _wait_for_watching(Path(env["CRG_HOME"]) / "watch-health")
 
         os.kill(pid, signal.SIGKILL)
         assert _wait_for(lambda: not _alive(pid))
@@ -1406,33 +1477,18 @@ class TestDaemonLifecycle:
 
         status = _daemon_cli("status", env=env)
         assert "not running" in status.stdout
-        assert str(orphan) not in status.stdout, (
-            "status now surfaces the orphan; update this test and the report"
-        )
+        assert str(orphan) in status.stdout, "status hides the orphaned watcher"
+        assert "orphan" in status.stdout
 
-        stop = _daemon_cli("stop", env=env)
-        assert stop.returncode == 1
-        assert "not running" in stop.stdout
-        assert _alive(orphan), "stop reaped the orphan (behaviour changed)"
-
+        # `start` reaps before it spawns, so exactly one watcher exists after.
         assert _daemon_cli("start", env=env).returncode == 0
-        assert _wait_for(lambda: _child_pids(env).get("r") not in (None, orphan))
-        duplicate = _child_pids(env)["r"]
-        spawned.extend([_daemon_pid(env), duplicate])
-        assert _alive(orphan) and _alive(duplicate)
-        assert duplicate != orphan, "two watchers now write the same graph.db"
+        assert _wait_for(lambda: not _alive(orphan)), "start left the orphan running"
+        assert _wait_for(lambda: bool(_child_pids(env).get("r")))
+        replacement = _child_pids(env)["r"]
+        spawned.extend([_daemon_pid(env), replacement])
+        assert replacement != orphan
+        assert _alive(replacement)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "BUG: nothing reaps a crashed daemon's children. The watchers are "
-            "plain subprocess.Popen children in the daemon's session; a "
-            "SIGKILLed daemon leaves them running forever, invisible to "
-            "`crg-daemon status`, and the next `start` adds a second watcher "
-            "per repo. daemon-state.json still holds the orphan PIDs but no "
-            "code path consults it for cleanup."
-        ),
-    )
     def test_crashed_daemon_children_should_not_survive(
         self, tmp_path: Path, daemon_env
     ) -> None:
@@ -1701,14 +1757,20 @@ class TestWatcherUnderStress:
         assert "Traceback" not in output, output[-2000:]
 
     def test_exhausted_watch_budget_leaves_nothing_watched(self, tmp_path: Path) -> None:
-        """Today's behaviour, and the dangerous one.
+        """An exhausted watch budget: nothing watched, and it says so.
 
         ``_WatchSupervisor._schedule`` catches ``OSError`` from
-        ``observer.schedule`` — the inotify ENOSPC that issue #811 is about —
-        logs a warning, and returns. It records no watch and does not set
-        ``degraded``. So the supervisor ends up watching nothing while
-        ``report_health`` publishes ``observer_alive: true, degraded: false``
-        and ``crg-daemon status`` prints ``ok``.
+        ``observer.schedule`` — the inotify ENOSPC that issue #811 is about.
+        It used to log a warning and return, recording no watch and leaving
+        ``degraded`` False, so the supervisor watched nothing while
+        ``report_health`` published ``observer_alive: true, degraded: false``
+        and ``crg-daemon status`` printed ``ok``. The refused directories are
+        now tracked, which is what the health file and ``watcher_status``
+        read.
+
+        ``check_liveness`` still reports nothing, and deliberately so: there
+        are no threads to find. Total blindness is caught by the watch loop
+        instead, which re-attempts the plan and then exits.
         """
         repo = _make_repo(tmp_path / "repo", 6)
         observer = _ExhaustedObserver()
@@ -1726,27 +1788,22 @@ class TestWatcherUnderStress:
         health = json.loads(health_path.read_text(encoding="utf-8"))
         assert health["watched_paths"] == 0
         assert health["observer_alive"] is True
-        assert health["degraded"] is False
+        assert health["degraded"] is True
         assert health["dead_threads"] == []
-        assert daemon_mod.watcher_status(True, health) == "ok"
+        assert daemon_mod.watcher_status(True, health) == "partial"
+        assert supervisor.unwatched_paths == sorted(set(observer.attempts))
 
-        # And the liveness check finds nothing wrong, because there are no
-        # threads to find: the watcher stays up, reporting healthy, forever.
+        # No threads died, so the liveness check has nothing to report.
         dead, repaired = supervisor.check_liveness()
         assert dead == [] and repaired == []
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "BUG: _WatchSupervisor._schedule swallows the OSError from "
-            "observer.schedule (inotify ENOSPC, the OS watch limit) without "
-            "marking the supervisor degraded. Coverage is lost silently: "
-            "watcher health still reads observer_alive=true, degraded=false, "
-            "and `crg-daemon status` prints 'ok' for a watcher that is "
-            "watching nothing. _promote_to_recursive sets _promotion_failed "
-            "on the same failure; _schedule does not."
-        ),
-    )
+        # Recovery is attempted before the loop gives up, and reports honestly.
+        assert supervisor.rewatch_all() is False
+        supervisor._observer = _WorkingObserver()
+        assert supervisor.rewatch_all() is True
+        assert supervisor.watched_paths
+        assert supervisor.degraded is False
+
     def test_exhausted_watch_budget_should_be_visible(self, tmp_path: Path) -> None:
         repo = _make_repo(tmp_path / "repo", 6)
         observer = _ExhaustedObserver()
@@ -1761,14 +1818,16 @@ class TestWatcherUnderStress:
         assert supervisor.degraded is True
         assert daemon_mod.watcher_status(True, health) != "ok"
 
-    def test_partial_schedule_failure_is_also_silent(self, tmp_path: Path) -> None:
-        """A directory adopted mid-run can fail to register and still report success.
+    def test_partial_schedule_failure_is_reported(self, tmp_path: Path) -> None:
+        """A directory adopted mid-run that fails to register says so.
 
         ``_adopt_directory`` logs "Watching new directory X (n watch(es))" and
         returns True whenever ``required`` is False, whether or not
         ``_schedule`` actually took. ``required`` is only True for a directory
         that a changed ignore rule newly included, so the ordinary case — a
-        new package appearing under a non-recursive watch — cannot fail loudly.
+        new package appearing under a non-recursive watch — used to lose
+        coverage without a trace. Same root cause as the exhausted budget
+        above, and the same fix: a refused schedule is recorded.
         """
         repo = _make_repo(tmp_path / "repo", 6)
         observer = _WorkingObserver()
@@ -1781,6 +1840,381 @@ class TestWatcherUnderStress:
         supervisor._observer = _ExhaustedObserver()
         adopted = supervisor._adopt_directory(str(new_dir))
 
-        assert adopted is True, "behaviour changed: adoption now reports failure"
+        # Adoption still succeeds, because the directory's current contents
+        # must be indexed either way; what it no longer does is hide that the
+        # watch behind it was refused.
+        assert adopted is True
         assert str(new_dir) not in supervisor.watched_paths
+        assert supervisor.degraded is True
+        assert str(new_dir) in supervisor.unwatched_paths
+
+
+# ---------------------------------------------------------------------------
+# 5. Telling a lock timeout apart from a genuine failure
+# ---------------------------------------------------------------------------
+
+
+# Poison one post-processing stage with a chosen sqlite3.OperationalError and
+# report the whole build result as JSON. An error constructed in Python carries
+# no ``sqlite_errorcode`` (the sqlite3 module sets that only on errors it
+# raises itself, and only from 3.11), so this drives the message fallback that
+# Python 3.10 relies on for every classification.
+_POISONED_BUILD = """
+import json, sqlite3, sys
+from code_review_graph.graph import GraphStore
+from code_review_graph.tools.build import build_or_update_graph
+
+repo, message = sys.argv[1], sys.argv[2]
+
+
+def boom(self, *args, **kwargs):
+    raise sqlite3.OperationalError(message)
+
+
+GraphStore.update_node_signatures = boom
+print("RESULT " + json.dumps(build_or_update_graph(
+    full_rebuild=True, repo_root=repo, postprocess="full",
+)))
+"""
+
+# The same poison, but through the hand-repair entry point.
+_POISONED_POSTPROCESS = """
+import json, sqlite3, sys
+from code_review_graph.graph import GraphStore
+from code_review_graph.tools.build import run_postprocess
+
+repo, message = sys.argv[1], sys.argv[2]
+
+
+def boom(self, *args, **kwargs):
+    raise sqlite3.OperationalError(message)
+
+
+GraphStore.resolve_bare_call_targets = boom
+print("RESULT " + json.dumps(run_postprocess(repo_root=repo)))
+"""
+
+
+def _run_poisoned(script: str, repo: Path, message: str, env: dict[str, str]) -> dict:
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(repo), message],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=_PROC_TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    line = next(
+        (ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")), None
+    )
+    assert line is not None, proc.stdout[-2000:]
+    return json.loads(line[len("RESULT "):])
+
+
+class TestErrorClassification:
+    """A lock timeout is transient; every other SQLite error is not."""
+
+    def test_only_a_lock_timeout_counts_as_contention(self, tmp_path: Path) -> None:
+        """``is_lock_contention`` separates SQLITE_BUSY from a real failure.
+
+        The two are indistinguishable by type — both arrive as
+        ``sqlite3.OperationalError`` — and treating the whole class as
+        contention is what pinned a graph as incomplete forever: the
+        build-state marker is deliberately left set for contention so the next
+        run redoes the lost stage, and an error that will recur every run can
+        never clear it.
+
+        Both errors here are raised by SQLite itself, so on Python 3.11+ this
+        exercises ``sqlite_errorcode``; the message fallback that 3.10 needs is
+        covered by the poisoned builds below.
+        """
+        from code_review_graph.tools.build import is_lock_contention
+
+        db = tmp_path / "probe.db"
+        holder = sqlite3.connect(str(db), timeout=0.1, isolation_level=None)
+        victim = sqlite3.connect(str(db), timeout=0.1, isolation_level=None)
+        try:
+            holder.execute("CREATE TABLE t (x)")
+            holder.execute("BEGIN EXCLUSIVE")
+            with pytest.raises(sqlite3.OperationalError) as busy:
+                victim.execute("INSERT INTO t VALUES (1)")
+            holder.rollback()
+            with pytest.raises(sqlite3.OperationalError) as malformed:
+                victim.execute("SELECT * FROM no_such_table")
+        finally:
+            holder.close()
+            victim.close()
+
+        # Canary: SQLite really produced two different failures, not one.
+        assert "locked" in str(busy.value)
+        assert "no such table" in str(malformed.value)
+
+        assert is_lock_contention(busy.value) is True
+        assert is_lock_contention(malformed.value) is False
+        # A disk problem and a read-only file are failures, not contention.
+        assert is_lock_contention(sqlite3.OperationalError("disk I/O error")) is False
+        assert is_lock_contention(
+            sqlite3.OperationalError("attempt to write a readonly database")
+        ) is False
+        assert is_lock_contention(ImportError("leidenalg")) is False
+
+    def test_a_genuine_postprocess_error_does_not_pin_the_graph_incomplete(
+        self, tmp_path: Path
+    ) -> None:
+        """A malformed statement clears the marker; a lock timeout keeps it.
+
+        ``build_state`` is written before the first node and cleared after the
+        last post-processing stage, and contention deliberately leaves it set:
+        the next run then redoes the stage it lost. Classifying *every*
+        ``sqlite3.OperationalError`` as contention turned that recovery into a
+        trap — a malformed statement or a failing disk kept the marker set on
+        every run, so the graph was marked incomplete forever and every later
+        update was promoted to a full rebuild that could not clear it.
+        """
+        home = tmp_path / "home"
+        repo = _make_repo(tmp_path / "repo", 6)
+        env = _isolated_env(home)
+        db = _db_path(repo)
+
+        failed = _run_poisoned(_POISONED_BUILD, repo, "no such column: bogus", env)
+        assert any("Signature computation failed" in w for w in failed["warnings"])
+        assert _metadata(db, "build_state") == "complete", (
+            "a permanent SQLite error left the graph marked half built"
+        )
+        # And it is not passed off as a clean build.
+        assert failed["status"] == "partial"
+        assert failed.get("postprocess_contended") is not True
+
+        # The contrast, on the same code path: real contention still holds the
+        # marker, which is the behaviour this must not have broken.
+        contended = _run_poisoned(_POISONED_BUILD, repo, "database is locked", env)
+        assert contended["postprocess_contended"] is True
+        # The files were all stored before the poisoned stage ran, so the
+        # marker holds at the post-processing state rather than claiming the
+        # graph is missing files.
+        assert _metadata(db, "build_state") == "postprocess-pending"
+
+    def test_hand_repair_clears_the_marker_despite_a_warning(
+        self, tmp_path: Path
+    ) -> None:
+        """``postprocess`` is the hand repair, so a warning must not block it.
+
+        Clearing the marker only on an empty warning list meant the command
+        people reach for to repair a half-built graph could not repair it in
+        exactly the cases that produce warnings — a missing optional extra, a
+        stage that failed for its own reasons. Only genuine contention holds
+        the marker now, because only contention is worth redoing.
+        """
+        home = tmp_path / "home"
+        repo = _make_repo(tmp_path / "repo", 6)
+        env = _isolated_env(home)
+        db = _db_path(repo)
+        assert _crg("build", "--repo", str(repo), env=env).returncode == 0
+        # The state a build that stored every file and then died leaves: the
+        # graph's contents are whole, its derived data is not. That is the
+        # state this command exists to clear.
+        _set_metadata(db, "build_state", "postprocess-pending")
+        assert _metadata(db, "build_state") == "postprocess-pending"  # canary
+
+        result = _run_poisoned(
+            _POISONED_POSTPROCESS, repo, "no such column: bogus", env
+        )
+        assert any("Call-target resolution failed" in w for w in result["warnings"])
+        assert _metadata(db, "build_state") == "complete", (
+            "a hand repair could not clear the marker it exists to clear"
+        )
+
+        # Contention is still the one reason to leave the repair unfinished.
+        _set_metadata(db, "build_state", "postprocess-pending")
+        contended = _run_poisoned(
+            _POISONED_POSTPROCESS, repo, "database is locked", env
+        )
+        assert contended["warnings"]
+        assert _metadata(db, "build_state") == "postprocess-pending"
+
+
+# ---------------------------------------------------------------------------
+# 6. Two daemons starting at once
+# ---------------------------------------------------------------------------
+
+
+# Holds the daemon lock without writing a PID file: exactly the window a second
+# ``crg-daemon start`` used to slip through, between one daemon forking and
+# that daemon labelling its lock.
+_LOCK_SQUATTER = """
+import sys, time
+from code_review_graph.daemon import acquire_daemon_lock
+assert acquire_daemon_lock(), "squatter could not take the lock"
+print("HELD", flush=True)
+time.sleep(float(sys.argv[1]))
+"""
+
+# Takes the lock the way the daemon does, PID file and all.
+_PID_HOLDER = """
+import sys, time
+from pathlib import Path
+from code_review_graph.daemon import write_pid
+write_pid(path=Path(sys.argv[1]))
+print("HELD", flush=True)
+time.sleep(float(sys.argv[2]))
+"""
+
+
+class _HeldLock:
+    """Context manager owning a process that holds the daemon lock."""
+
+    def __init__(self, script: str, *args: str, env: dict[str, str]) -> None:
+        self._cmd = [sys.executable, "-c", script, *args]
+        self._env = env
+        self.proc: subprocess.Popen[str] | None = None
+
+    def __enter__(self) -> "_HeldLock":
+        self.proc = subprocess.Popen(
+            self._cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self._env,
+        )
+        assert self.proc.stdout is not None
+        line = self.proc.stdout.readline().strip()
+        assert line == "HELD", f"holder never took the daemon lock: {line!r}"
+        return self
+
+    @property
+    def pid(self) -> int:
+        assert self.proc is not None
+        return self.proc.pid
+
+    def __exit__(self, *_exc) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.kill()
+        if self.proc is not None:
+            self.proc.wait(timeout=30)
+
+
+class TestDaemonExclusion:
+    """The daemon lock has to exclude a second daemon, not just label one."""
+
+    def test_write_pid_refuses_when_another_process_holds_the_lock(
+        self, tmp_path: Path, daemon_env
+    ) -> None:
+        """A second claim is refused, and says whose it is.
+
+        ``write_pid`` took the lock and discarded the answer, so the lock
+        identified the daemon but excluded nothing: the second caller
+        overwrote the PID file and carried on, leaving one of the two daemons
+        invisible to every later ``status`` and ``stop``.
+        """
+        env, _spawned = daemon_env
+        pid_path = Path(env["CRG_HOME"]) / "daemon.pid"
+
+        with _HeldLock(_PID_HOLDER, str(pid_path), "120", env=env) as holder:
+            assert pid_path.read_text(encoding="utf-8").strip() == str(holder.pid)
+
+            with pytest.raises(daemon_mod.DaemonAlreadyRunningError) as refused:
+                daemon_mod.write_pid(path=pid_path)
+
+            # It names the holder, so the message is actionable.
+            assert str(holder.pid) in str(refused.value)
+            assert str(daemon_mod.daemon_lock_path(pid_path)) in str(refused.value)
+            assert refused.value.pid == holder.pid
+            # And the refusal left the holder's label untouched.
+            assert pid_path.read_text(encoding="utf-8").strip() == str(holder.pid)
+
+    def test_second_start_is_refused_while_the_lock_is_held(
+        self, tmp_path: Path, daemon_env
+    ) -> None:
+        """Two ``crg-daemon start`` calls at once: one daemon, not two.
+
+        ``is_daemon_running`` is a read of the PID file, and a daemon that has
+        forked but not yet written that file is invisible to it — the same
+        window two simultaneous starts race through. The lock is what decides,
+        so the start that loses it stops, names the winner, and exits non-zero
+        instead of forking a second daemon onto the same repositories.
+        """
+        env, spawned = daemon_env
+
+        with _HeldLock(_LOCK_SQUATTER, "120", env=env):
+            pid_file = Path(env["CRG_HOME"]) / "daemon.pid"
+            # Canary: the PID file really is absent, so `is_daemon_running`
+            # cannot be what refuses this start.
+            assert not pid_file.exists()
+
+            started = _daemon_cli("start", env=env)
+            output = started.stdout + started.stderr
+            if started.returncode == 0 and _daemon_pid(env) is not None:
+                spawned.append(_daemon_pid(env))  # pragma: no cover - failure path
+
+            assert started.returncode != 0, output
+            assert "already running" in output.lower(), output
+            assert not pid_file.exists(), "a refused start still labelled the lock"
+
+
+# ---------------------------------------------------------------------------
+# 7. The refused-watch record stays bounded
+# ---------------------------------------------------------------------------
+
+
+class TestUnwatchedRecord:
+    """What the supervisor remembers about directories it could not watch."""
+
+    def test_refusals_for_vanished_directories_are_forgotten(
+        self, tmp_path: Path
+    ) -> None:
+        """Churned build directories must not accumulate for the daemon's life.
+
+        A refused directory never enters ``_watches``, so neither a successful
+        reschedule nor ``_release_directory`` ever reaches it. A tree that is
+        created and deleted on every build therefore left one entry per run:
+        ``degraded`` stayed true forever over directories that no longer
+        exist, and every health file published the growing list.
+        """
+        repo = _make_repo(tmp_path / "repo", 6)
+        observer = _WorkingObserver()
+        supervisor = _WatchSupervisor(observer, repo, [], max_schedules=512)
+        supervisor.schedule_initial(handler=object())
+        assert supervisor.watched_paths, "nothing was watched to begin with"
+        assert supervisor.degraded is False  # canary: a clean start
+
+        churned = [repo / "src" / f"build{i}" for i in range(40)]
+        supervisor._observer = _ExhaustedObserver()
+        for directory in churned:
+            directory.mkdir()
+            supervisor._adopt_directory(str(directory))
+        # Canary: every refusal really was recorded, which is the behaviour
+        # that must survive.
+        assert {str(d) for d in churned} <= set(supervisor.unwatched_paths)
+        assert supervisor.degraded is True
+
+        for directory in churned:
+            directory.rmdir()
+        supervisor._observer = observer
+        supervisor.sync_watches()
+
+        assert [p for p in supervisor.unwatched_paths if p.startswith(
+            str(repo / "src" / "build")
+        )] == [], supervisor.unwatched_paths
         assert supervisor.degraded is False
+
+    def test_the_record_is_capped_even_if_nothing_is_ever_pruned(
+        self, tmp_path: Path
+    ) -> None:
+        """A cap bounds the record between reconciliations.
+
+        Pruning runs once a tick; the cap is what keeps a burst inside one tick
+        from growing the health payload without limit. The newest refusals are
+        the ones kept, because they are the ones that still describe the tree.
+        """
+        from code_review_graph.incremental import _MAX_UNWATCHED_TRACKED
+
+        repo = _make_repo(tmp_path / "repo", 6)
+        supervisor = _WatchSupervisor(_WorkingObserver(), repo, [], max_schedules=8)
+        total = _MAX_UNWATCHED_TRACKED + 25
+        for i in range(total):
+            supervisor._note_unwatched(str(repo / "src" / f"gone{i:05d}"))
+
+        assert len(supervisor.unwatched_paths) == _MAX_UNWATCHED_TRACKED
+        assert str(repo / "src" / f"gone{total - 1:05d}") in supervisor.unwatched_paths
+        assert str(repo / "src" / "gone00000") not in supervisor.unwatched_paths

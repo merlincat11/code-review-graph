@@ -39,6 +39,62 @@ def _calls(store: GraphStore, caller: str):
     ).fetchall()
 
 
+@pytest.mark.parametrize("scope", [None, "package", "tree"])
+def test_import_scope_and_csharp_using_metadata_survive_together(tmp_path, scope):
+    source = "namespace App { using Alias = Other; using System; class C {} }"
+    path = tmp_path / "Imports.cs"
+    path.write_text(source, encoding="utf-8")
+    parser = CodeParser(tmp_path)
+    # C# currently has no directory import resolver. Inject its boundary result
+    # to pin metadata composition independently of language-specific resolution.
+    with patch.object(parser, "_resolve_import_target", return_value=("Other", scope)):
+        nodes, edges = parser.parse_file(path)
+    with GraphStore(tmp_path / ".code-review-graph" / "graph.db") as store:
+        store.store_file_nodes_edges(str(path), nodes, edges, "test-hash")
+        imports = [edge for edge in store.get_all_edges() if edge.kind == "IMPORTS_FROM"]
+        imports.sort(key=lambda edge: edge.extra["source_offset"])
+        assert len(imports) == 2
+        for edge, directive in zip(imports, ("using Alias", "using System")):
+            assert edge.extra.get("import_scope") == scope
+            assert edge.extra["source_offset"] == source.index(directive)
+            assert edge.extra["csharp_scopes"] == [["App", 0], ["", -1]]
+            assert edge.extra["csharp_global"] is False
+        assert imports[0].extra["csharp_using_kind"] == "alias"
+        assert imports[0].extra["csharp_alias"] == "Alias"
+        assert imports[1].extra["csharp_using_kind"] == "namespace"
+        assert "csharp_alias" not in imports[1].extra
+
+
+def test_csharp_retry_metadata_precedes_build_checkpoint(tmp_path, monkeypatch):
+    from code_review_graph import incremental
+    from code_review_graph.build_state import (
+        BUILD_IN_PROGRESS,
+        BUILD_STATE_KEY,
+        POSTPROCESS_PENDING,
+        advance_to_postprocess_pending,
+    )
+
+    (tmp_path / "Bad.cs").write_text("class C {}", encoding="utf-8")
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    snapshots = []
+
+    def checkpoint(store):
+        snapshots.append((
+            store.get_metadata("csharp_identity_version"),
+            json.loads(store.get_metadata("csharp_identity_pending_files") or "[]"),
+        ))
+        advance_to_postprocess_pending(store)
+
+    monkeypatch.setattr(incremental, "advance_to_postprocess_pending", checkpoint)
+    with GraphStore(tmp_path / ".code-review-graph" / "graph.db") as store:
+        store.set_metadata(BUILD_STATE_KEY, BUILD_IN_PROGRESS)
+        with patch.object(CodeParser, "parse_bytes", side_effect=ValueError("parse failed")):
+            result = incremental.full_build(tmp_path, store)
+        assert [error["file"] for error in result["errors"]] == ["Bad.cs"]
+        assert snapshots == [(CSHARP_IDENTITY_VERSION, ["Bad.cs"])]
+        assert store.get_metadata(BUILD_STATE_KEY) == POSTPROCESS_PENDING
+
+
 @pytest.mark.parametrize(("source", "caller", "expected"), [
     (
         "namespace Other { class App { public class Report { public class ExportHandler "

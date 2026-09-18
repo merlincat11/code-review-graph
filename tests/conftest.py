@@ -14,29 +14,6 @@ import os
 import pytest
 
 
-def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Keep the ``packaging`` gate out of an ordinary ``pytest tests/`` run.
-
-    ``tests/test_packaging.py`` builds a wheel and an sdist, creates three
-    virtual environments and installs into each of them over the network. It
-    is a release gate, not a per-commit check, so registering the marker is
-    not enough -- it has to be off by default.
-
-    It runs when the marker expression names it (``-m packaging``,
-    ``-m "packaging or e2e"``) or when ``CRG_RUN_PACKAGING_TESTS=1`` is set.
-    """
-    if "packaging" in (config.option.markexpr or ""):
-        return
-    if os.environ.get("CRG_RUN_PACKAGING_TESTS") == "1":
-        return
-    skip = pytest.mark.skip(
-        reason="packaging gate: run with `-m packaging` or CRG_RUN_PACKAGING_TESTS=1"
-    )
-    for item in items:
-        if "packaging" in item.keywords:
-            item.add_marker(skip)
-
-
 @pytest.fixture(autouse=True)
 def isolated_crg_home(tmp_path_factory, monkeypatch):
     """Redirect the per-user state directory into a temporary directory.
@@ -72,13 +49,30 @@ def isolated_crg_home(tmp_path_factory, monkeypatch):
 # ``-m`` expression names its marker, so ``pytest tests/`` stays fast while
 # ``pytest -m <marker>`` still finds the tests. Add a marker name to the set
 # (and to the ``markers`` list in pyproject.toml) to gate another suite.
-_OPT_IN_MARKERS = frozenset({"cli_surface", "corpus", "determinism", "platform_lifecycle"})
+#
+# One hook, not one per suite: pytest looks the name up on the module, so a
+# second ``pytest_collection_modifyitems`` here would silently shadow the
+# first and every gate defined above it would stop running.
+_OPT_IN_MARKERS = frozenset({
+    "cli_surface", "corpus", "determinism", "packaging", "platform_lifecycle",
+})
+
+# Environment escape hatches, for suites that also need to be switchable on
+# without a ``-m`` expression (CI runs them alongside the ordinary suite).
+_OPT_IN_ENV_OVERRIDES = {"packaging": "CRG_RUN_PACKAGING_TESTS"}
 
 
 def pytest_collection_modifyitems(config, items):
     """Skip opt-in suites unless the run explicitly selects their marker."""
     expression = config.getoption("-m", default="") or ""
-    gated = {name for name in _OPT_IN_MARKERS if name not in expression}
+    gated = set()
+    for name in _OPT_IN_MARKERS:
+        if name in expression:
+            continue
+        override = _OPT_IN_ENV_OVERRIDES.get(name)
+        if override and os.environ.get(override) == "1":
+            continue
+        gated.add(name)
     if not gated:
         return
     for item in items:

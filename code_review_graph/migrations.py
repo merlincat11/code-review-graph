@@ -2,15 +2,73 @@
 
 Manages incremental schema changes via versioned migration functions.
 Each migration is idempotent (uses IF NOT EXISTS / column existence checks).
+
+Idempotence used to be "check, then act", which is only safe for one process.
+A watcher child, a PostToolUse hook and a hand-run ``build`` can all open the
+same fresh ``graph.db`` at once, and every one of them runs the pending
+migrations from :meth:`GraphStore.__init__`.  Two openers could both see a
+column missing, both issue the ``ALTER``, and the loser died with
+``duplicate column name: signature`` before its caller had a database at all.
+
+The check is therefore a fast path only.  The act itself is now idempotent at
+the SQL level: :func:`_apply` treats "already exists" as success, so whichever
+opener loses the race simply adopts the winner's schema.  Contention on the
+write lock is retried rather than raised, because a migration is a handful of
+statements and the other process is about to finish.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
+import time
 from typing import Callable
 
 logger = logging.getLogger(__name__)
+
+# The whole migration set is a few DDL statements; a peer running it holds the
+# write lock for milliseconds.  Retrying is cheaper, and far less confusing,
+# than handing "database is locked" back out of GraphStore.__init__.
+_MAX_ATTEMPTS = 5
+_RETRY_BASE_SECONDS = 0.05
+
+# Substrings of the SQLite errors that mean "another process already applied
+# this exact change".  They are outcomes, not failures.
+_ALREADY_APPLIED = (
+    "duplicate column name",
+    "already exists",
+)
+
+# Substrings that mean "someone else is writing; nothing was applied".
+_CONTENDED = (
+    "database is locked",
+    "database table is locked",
+    "database schema is locked",
+    "cannot start a transaction within a transaction",
+)
+
+
+def _matches(exc: sqlite3.Error, needles: tuple[str, ...]) -> bool:
+    message = str(exc).lower()
+    return any(needle in message for needle in needles)
+
+
+def _apply(conn: sqlite3.Connection, sql: str, *, what: str) -> bool:
+    """Execute one DDL statement, tolerating a peer that already applied it.
+
+    Returns True when this process made the change, False when it found the
+    change already present.  Any other error is re-raised: a migration that
+    fails for a real reason must still stop the opener.
+    """
+    try:
+        conn.execute(sql)
+    except sqlite3.OperationalError as exc:
+        if _matches(exc, _ALREADY_APPLIED):
+            logger.debug("%s already applied by another process", what)
+            return False
+        raise
+    return True
 
 
 def get_schema_version(conn: sqlite3.Connection) -> int:
@@ -147,8 +205,12 @@ _BACKFILL_BATCH = 5_000
 def _migrate_v2(conn: sqlite3.Connection) -> None:
     """v2: Add signature column to nodes table."""
     if not _has_column(conn, "nodes", "signature"):
-        conn.execute("ALTER TABLE nodes ADD COLUMN signature TEXT")
-        logger.info("Migration v2: added 'signature' column to nodes")
+        if _apply(
+            conn,
+            "ALTER TABLE nodes ADD COLUMN signature TEXT",
+            what="nodes.signature",
+        ):
+            logger.info("Migration v2: added 'signature' column to nodes")
 
 
 def _migrate_v3(conn: sqlite3.Connection) -> None:
@@ -203,8 +265,12 @@ def _migrate_v4(conn: sqlite3.Connection) -> None:
         )
     """)
     if not _has_column(conn, "nodes", "community_id"):
-        conn.execute("ALTER TABLE nodes ADD COLUMN community_id INTEGER")
-        logger.info("Migration v4: added 'community_id' column to nodes")
+        if _apply(
+            conn,
+            "ALTER TABLE nodes ADD COLUMN community_id INTEGER",
+            what="nodes.community_id",
+        ):
+            logger.info("Migration v4: added 'community_id' column to nodes")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_nodes_community ON nodes(community_id)"
     )
@@ -220,14 +286,18 @@ def _migrate_v4(conn: sqlite3.Connection) -> None:
 def _migrate_v5(conn: sqlite3.Connection) -> None:
     """v5: Create FTS5 virtual table for nodes."""
     if not _table_exists(conn, "nodes_fts"):
-        conn.execute("""
+        if _apply(
+            conn,
+            """
             CREATE VIRTUAL TABLE nodes_fts USING fts5(
                 name, qualified_name, file_path, signature,
                 content='nodes', content_rowid='rowid',
                 tokenize='porter unicode61'
             )
-        """)
-        logger.info("Migration v5: created nodes_fts FTS5 virtual table")
+            """,
+            what="nodes_fts",
+        ):
+            logger.info("Migration v5: created nodes_fts FTS5 virtual table")
 
 
 def _migrate_v6(conn: sqlite3.Connection) -> None:
@@ -290,7 +360,17 @@ def _migrate_v7(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_v8(conn: sqlite3.Connection) -> None:
-    """v8: Add composite index on edges for upsert_edge performance."""
+    """v8: Add composite index on edges for upsert_edge performance.
+
+    ``edges.line`` comes from the base schema, which ``_init_schema`` applies
+    before the migrations run.  A database that predates it (or one built by
+    something other than ``GraphStore``) would otherwise fail the whole open
+    with ``no such column: line`` — an index is a speed-up, never a reason to
+    refuse to open the graph.
+    """
+    if not _has_column(conn, "edges", "line"):
+        logger.info("Migration v8: skipped, edges.line is not present")
+        return
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_edges_composite
         ON edges(kind, source_qualified, target_qualified, file_path, line)
@@ -301,12 +381,16 @@ def _migrate_v8(conn: sqlite3.Connection) -> None:
 def _migrate_v9(conn: sqlite3.Connection) -> None:
     """v9: Add confidence scoring to edges."""
     if not _has_column(conn, "edges", "confidence"):
-        conn.execute(
-            "ALTER TABLE edges ADD COLUMN confidence REAL DEFAULT 1.0"
+        _apply(
+            conn,
+            "ALTER TABLE edges ADD COLUMN confidence REAL DEFAULT 1.0",
+            what="edges.confidence",
         )
     if not _has_column(conn, "edges", "confidence_tier"):
-        conn.execute(
-            "ALTER TABLE edges ADD COLUMN confidence_tier TEXT DEFAULT 'EXTRACTED'"
+        _apply(
+            conn,
+            "ALTER TABLE edges ADD COLUMN confidence_tier TEXT DEFAULT 'EXTRACTED'",
+            what="edges.confidence_tier",
         )
     logger.info("Migration v9: added edge confidence columns")
 
@@ -320,7 +404,11 @@ def _migrate_v10(conn: sqlite3.Connection) -> None:
     and scanned the whole table on every dotted symbol query.
     """
     if not _has_column(conn, "nodes", "symbol"):
-        conn.execute("ALTER TABLE nodes ADD COLUMN symbol TEXT")
+        _apply(
+            conn,
+            "ALTER TABLE nodes ADD COLUMN symbol TEXT",
+            what="nodes.symbol",
+        )
     # instr() returns 0 when "::" is absent, in which case the qualified name
     # is already a bare symbol. Mirrors graph._symbol_of.
     conn.execute(
@@ -511,11 +599,53 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
 LATEST_VERSION = max(MIGRATIONS.keys())
 
 
+def _run_one(conn: sqlite3.Connection, version: int) -> None:
+    """Apply a single migration, surviving a peer doing the same thing.
+
+    Two kinds of failure are not failures here:
+
+    * the change is already present, because another opener won the race —
+      :func:`_apply` absorbs those at the statement that hits them, so the
+      rest of the migration still runs and nothing is half-applied;
+    * the write lock is held, because another opener is mid-migration — the
+      attempt is retried, by which time the peer has committed and every
+      statement takes the "already present" path.
+
+    Anything else is re-raised.
+    """
+    last: sqlite3.Error | None = None
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            MIGRATIONS[version](conn)
+            _set_schema_version(conn, version)
+            conn.commit()
+            return
+        except sqlite3.OperationalError as exc:
+            conn.rollback()
+            if not _matches(exc, _CONTENDED):
+                logger.error("Migration v%d failed", version, exc_info=True)
+                raise
+            last = exc
+            # Backoff jittered by PID, so two openers that started together do
+            # not keep retrying in lockstep. Derived from the PID rather than
+            # a random source because this needs spread, not unpredictability.
+            jitter = 0.5 + (os.getpid() % 101) / 100.0
+            time.sleep(_RETRY_BASE_SECONDS * (2**attempt) * jitter)
+        except sqlite3.Error:
+            conn.rollback()
+            logger.error("Migration v%d failed, rolling back", version, exc_info=True)
+            raise
+    logger.error("Migration v%d could not get the write lock", version)
+    raise last if last is not None else sqlite3.OperationalError("database is locked")
+
+
 def run_migrations(conn: sqlite3.Connection) -> None:
     """Run all pending migrations in order.
 
-    Each migration runs in its own transaction. The schema_version metadata
-    entry is updated after each successful migration.
+    Safe to run from several processes at once: each statement tolerates a
+    peer having already applied it, and lock contention is retried rather
+    than raised.  The schema_version metadata entry is updated after each
+    successful migration.
     """
     current = get_schema_version(conn)
     if current >= LATEST_VERSION:
@@ -527,13 +657,6 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         if version <= current:
             continue
         logger.info("Running migration v%d", version)
-        try:
-            MIGRATIONS[version](conn)
-            _set_schema_version(conn, version)
-            conn.commit()
-        except sqlite3.Error:
-            conn.rollback()
-            logger.error("Migration v%d failed, rolling back", version, exc_info=True)
-            raise
+        _run_one(conn, version)
 
     logger.info("Migrations complete, now at schema version %d", LATEST_VERSION)

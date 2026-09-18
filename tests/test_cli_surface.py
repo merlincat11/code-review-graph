@@ -50,6 +50,7 @@ import ast
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -152,9 +153,18 @@ ALL_FLAGS: set[tuple[str, str]] = {
 # Enumerating environment variables from the package source
 # ---------------------------------------------------------------------------
 
+#: Two spellings count as reading an environment variable: the raw
+#: ``os.environ.get("NAME")`` and the package's own guarded numeric readers,
+#: ``constants.env_int("NAME", default)`` / ``env_float``. Matching only the
+#: raw one would make this whole module blind to every setting the #912 fix
+#: moved behind the helper.
 _ENV_READ_RE = re.compile(
-    r"""os\.(?:environ\.get|getenv)\(\s*["']([A-Z][A-Z0-9_]*)["']"""
+    r"""(?:os\.(?:environ\.get|getenv)|env_int|env_float)\(\s*["']([A-Z][A-Z0-9_]*)["']"""
 )
+
+#: Helper names that parse an environment variable as a number *and* fall
+#: back to the documented default instead of raising.
+_GUARDED_NUMERIC_HELPERS = frozenset({"env_int", "env_float", "_bounded_float_env"})
 
 
 def _python_sources() -> Iterable[Path]:
@@ -446,14 +456,23 @@ def test_canary_harness_actually_runs_the_cli(built_repo, cli_env):
     assert re.search(r"\d+\.\d+", result.output), result.describe()
 
 
-def test_canary_harness_detects_a_traceback(built_repo, cli_env):
+def test_canary_harness_detects_a_traceback(built_repo, cli_env, tmp_path):
     """Prove the traceback detector fires on a run that really does crash.
 
-    ``CRG_MAX_IMPACT_NODES=`` is the #912 import-time failure; if this stops
-    tracebacking, the detector is still proven by the assertion below flipping
-    to XPASS in ``test_invalid_numeric_env_var_does_not_traceback``.
+    This used to use ``CRG_MAX_IMPACT_NODES=``, the #912 import-time failure.
+    That is fixed, and so is every other failure this module knows how to
+    name, so the canary needs a crash of its own: a ``PYTHONPATH`` shim that
+    shadows ``sqlite3`` with a module that raises ``RuntimeError``. Nothing
+    catches that, which is the point — an unforeseen bug must still show its
+    traceback. If this stops producing one, every ``assert not
+    result.traceback`` below is vacuous.
     """
-    env = {**cli_env, "CRG_MAX_IMPACT_NODES": ""}
+    shim = tmp_path / "crash-shim"
+    shim.mkdir()
+    (shim / "sqlite3.py").write_text(
+        'raise RuntimeError("sqlite3 shadowed by test shim")\n', encoding="utf-8"
+    )
+    env = {**cli_env, "PYTHONPATH": str(shim)}
     result = run_cli("status", cwd=built_repo, env=env)
     assert result.traceback, "the detector missed a real traceback:\n" + result.describe()
     assert result.returncode not in (0, None), result.describe()
@@ -783,33 +802,70 @@ def test_truncated_database_does_not_traceback(fresh_built_repo, cli_env):
     assert not result.traceback, result.describe()
 
 
+def _corrupt(db: Path, kind: str) -> None:
+    """Damage *db* in one of the four ways a graph.db goes bad in the wild."""
+    for suffix in ("-wal", "-shm"):
+        db.with_name(db.name + suffix).unlink(missing_ok=True)
+    if kind == "garbage":
+        db.write_bytes(os.urandom(64 * 1024))
+    elif kind == "truncated":
+        # A partial write: a real SQLite header over a body that ends early.
+        db.write_bytes(db.read_bytes()[:512])
+    elif kind == "foreign-sqlite":
+        # A perfectly valid SQLite file belonging to something else. CREATE
+        # TABLE IF NOT EXISTS would otherwise graft our schema onto it.
+        db.unlink()
+        conn = sqlite3.connect(str(db))
+        conn.execute("CREATE TABLE invoices (id INTEGER PRIMARY KEY, total REAL)")
+        conn.commit()
+        conn.close()
+    elif kind == "newer-schema":
+        conn = sqlite3.connect(str(db))
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) "
+            "VALUES ('schema_version', '99')"
+        )
+        conn.commit()
+        conn.close()
+    else:  # pragma: no cover - guards the parameter list against typos
+        raise AssertionError(f"unknown corruption kind: {kind}")
+
+
 @pytest.mark.parametrize("command", DB_CONSUMING_COMMANDS)
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: a corrupt graph.db raises sqlite3.DatabaseError('file is not a "
-        "database') out of GraphStore.__init__ (graph.py:219) straight through "
-        "cli.py:1747 as a traceback, on every command"
-    ),
-)
 def test_corrupt_database_is_reported_cleanly(command, fresh_built_repo, cli_env):
     """Garbage bytes in graph.db: one line naming the file, exit 1."""
     db = fresh_built_repo / ".code-review-graph" / "graph.db"
-    for suffix in ("-wal", "-shm"):
-        db.with_name(db.name + suffix).unlink(missing_ok=True)
-    db.write_bytes(os.urandom(64 * 1024))
+    _corrupt(db, "garbage")
     result = run_cli(*_invoke(command), cwd=fresh_built_repo, env=cli_env)
     assert_clean_failure(result)
+    assert str(db) in result.output, result.describe()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: a graph.db built for a different repository root is accepted "
-        "silently; `dead-code` then reports the other repository's symbols, "
-        "with the other repository's absolute paths, and exits 0"
-    ),
+@pytest.mark.parametrize(
+    "kind", ["garbage", "truncated", "foreign-sqlite", "newer-schema"]
 )
+def test_every_kind_of_corrupt_database_is_reported_cleanly(
+    kind, fresh_built_repo, cli_env
+):
+    """Four ways a graph.db goes bad, one house-style line for each.
+
+    ``garbage`` and ``truncated`` are read failures SQLite itself reports.
+    ``foreign-sqlite`` and ``newer-schema`` are the quiet ones: both open
+    without complaint and used to be answered from as though they were this
+    repository's graph.
+    """
+    db = fresh_built_repo / ".code-review-graph" / "graph.db"
+    _corrupt(db, kind)
+    result = run_cli("status", cwd=fresh_built_repo, env=cli_env)
+    assert_clean_failure(result)
+    assert result.output.strip().startswith("Error: "), result.describe()
+    assert str(db) in result.output, result.describe()
+    if kind == "newer-schema":
+        assert "newer" in result.output, result.describe()
+    if kind == "foreign-sqlite":
+        assert "not a code-review-graph" in result.output, result.describe()
+
+
 def test_foreign_repository_database_is_rejected(tmp_path, cli_env):
     donor = init_repo(tmp_path / "donor")
     (donor / "lib").mkdir()
@@ -835,6 +891,8 @@ def test_foreign_repository_database_is_rejected(tmp_path, cli_env):
     assert "donor_only" not in result.output, (
         "the host repository was served the donor repository's graph:\n" + result.describe()
     )
+    assert_clean_failure(result)
+    assert "different repository root" in result.output, result.describe()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory permissions")
@@ -843,14 +901,6 @@ def test_foreign_repository_database_is_rejected(tmp_path, cli_env):
     reason="root ignores the read-only bit",
 )
 @pytest.mark.parametrize("command", ["status", "detect-changes", "wiki", "visualize", "build"])
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: an unwritable data directory raises sqlite3.OperationalError "
-        "('attempt to write a readonly database') from the PRAGMA journal_mode=WAL "
-        "in GraphStore.__init__ as a traceback, on every command"
-    ),
-)
 def test_read_only_data_dir_is_reported_cleanly(command, fresh_built_repo, cli_env):
     data_dir = fresh_built_repo / ".code-review-graph"
     original = data_dir.stat().st_mode
@@ -858,6 +908,8 @@ def test_read_only_data_dir_is_reported_cleanly(command, fresh_built_repo, cli_e
     try:
         result = run_cli(*_invoke(command), cwd=fresh_built_repo, env=cli_env)
         assert_clean_failure(result)
+        assert result.output.strip().startswith("Error: "), result.describe()
+        assert str(data_dir) in result.output, result.describe()
     finally:
         data_dir.chmod(original)
 
@@ -986,16 +1038,6 @@ def _no_git_env(cli_env: dict[str, str], tmp_path: Path) -> dict[str, str]:
     return {**cli_env, "PATH": str(empty)}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: with no `git` binary on PATH, `detect-changes` prints "
-        "'No changes detected.' and exits 0 even when the working tree HAS "
-        "changed. parse_diff_ranges (changes.py:77) returns {} on OSError, and "
-        "the caller cannot tell 'no changes' from 'could not look'. A review "
-        "gate built on this exit code gives a false all-clear"
-    ),
-)
 def test_absent_git_binary_is_not_a_false_all_clear(tmp_path, cli_env):
     repo = init_repo(tmp_path / "repo")
     write_sample_project(repo)
@@ -1020,16 +1062,16 @@ def test_absent_git_binary_is_not_a_false_all_clear(tmp_path, cli_env):
     assert "No changes detected" not in without_git.output, (
         "reported a clean tree while unable to read the diff:\n" + without_git.describe()
     )
+    # A distinct, loud outcome: non-zero exit, and a message naming the cause.
+    assert_clean_failure(without_git)
+    assert without_git.output.strip().startswith("Error: "), without_git.describe()
+    assert "git" in without_git.output, without_git.describe()
+    assert without_git.returncode != with_git.returncode, (
+        "'could not look' and 'nothing changed' exit the same way:\n"
+        + without_git.describe()
+    )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: the same false all-clear when `git diff` times out "
-        "(CRG_GIT_TIMEOUT=0 forces subprocess.TimeoutExpired); changes.py:77 "
-        "swallows it and returns {}"
-    ),
-)
 def test_git_timeout_is_not_a_false_all_clear(tmp_path, cli_env):
     repo = init_repo(tmp_path / "repo")
     write_sample_project(repo)
@@ -1049,10 +1091,23 @@ def test_git_timeout_is_not_a_false_all_clear(tmp_path, cli_env):
     )
     assert not timed_out.traceback, timed_out.describe()
     assert "No changes detected" not in timed_out.output, timed_out.describe()
+    assert_clean_failure(timed_out)
+    assert timed_out.output.strip().startswith("Error: "), timed_out.describe()
+    assert "timed out" in timed_out.output, timed_out.describe()
+    assert "CRG_GIT_TIMEOUT" in timed_out.output, timed_out.describe()
+
+
+#: Exit code each command owes with no ``git`` on PATH. ``build`` and
+#: ``update`` do not need the diff — they can re-parse the working tree and
+#: reconcile by content hash — so they still succeed. ``detect-changes``
+#: cannot: its whole answer is the diff, so it reports the inability and
+#: exits 1 rather than printing the same all-clear as a clean tree
+#: (see test_absent_git_binary_is_not_a_false_all_clear).
+_NO_GIT_EXIT_CODES: dict[str, int] = {"detect-changes": 1}
 
 
 def test_absent_git_binary_does_not_traceback(tmp_path, cli_env):
-    """Whatever it reports, it must not crash. This part already holds."""
+    """Whatever it reports, it must not crash."""
     repo = init_repo(tmp_path / "repo")
     write_sample_project(repo)
     _git(repo, "add", "-A")
@@ -1062,7 +1117,7 @@ def test_absent_git_binary_does_not_traceback(tmp_path, cli_env):
     for argv in (["status"], ["detect-changes", "--brief"], ["update", "-q"], ["build", "-q"]):
         result = run_cli(*argv, cwd=repo, env=no_git)
         assert not result.traceback, result.describe()
-        assert result.returncode == 0, result.describe()
+        assert result.returncode == _NO_GIT_EXIT_CODES.get(argv[0], 0), result.describe()
 
 
 def test_repo_flag_pointing_outside_any_project(built_repo, cli_env, tmp_path):
@@ -1094,10 +1149,15 @@ class NumericVar:
 
 NUMERIC_ENV_VARS: tuple[NumericVar, ...] = (
     NumericVar("CRG_GIT_TIMEOUT", ("status",), "45"),
+    # Read through a local variable, so ``_numeric_env_sites`` cannot see
+    # the parse; listed by hand so the reachable-value tests still run it.
+    NumericVar("CRG_DISCOVERY_TIMEOUT", ("detect-changes", "--brief"), "3"),
     NumericVar("CRG_MAX_IMPACT_NODES", ("status",), "250"),
     NumericVar("CRG_MAX_IMPACT_DEPTH", ("status",), "3"),
     NumericVar("CRG_MAX_BFS_DEPTH", ("status",), "10"),
     NumericVar("CRG_MAX_SEARCH_RESULTS", ("status",), "15"),
+    NumericVar("CRG_IMPACT_DEPTH_DECAY", ("status",), "0.5"),
+    NumericVar("CRG_IMPACT_SCORE_FLOOR", ("status",), "0.1"),
     NumericVar("CRG_PARSE_WORKERS", ("status",), "2"),
     NumericVar("CRG_MODULE_SCAN_DEPTH", ("status",), "2"),
     NumericVar("CRG_MODULE_SCAN_MAX_DIRS", ("status",), "100"),
@@ -1107,9 +1167,12 @@ NUMERIC_ENV_VARS: tuple[NumericVar, ...] = (
     NumericVar("CRG_MAX_WATCH_SCHEDULES", ("status",), "8"),
     NumericVar("CRG_WATCH_SPLIT_MIN_DIRS", ("status",), "2"),
     NumericVar("CRG_WATCH_HEALTH_INTERVAL", ("status",), "5"),
+    NumericVar("CRG_MAX_UNWATCHED_TRACKED", ("status",), "64"),
     NumericVar("CRG_MAX_CHANGED_FUNCS", ("detect-changes", "--brief"), "100"),
     NumericVar("CRG_MAX_TRANSITIVE_FRONTIER", ("detect-changes", "--brief"), "20"),
     NumericVar("CRG_CHURN_WINDOW_DAYS", ("detect-changes", "--brief", "--churn"), "30"),
+    NumericVar("CRG_CHURN_TIMEOUT", ("detect-changes", "--brief", "--churn"), "10"),
+    NumericVar("CRG_CHURN_MAX_COMMITS", ("detect-changes", "--brief", "--churn"), "500"),
     NumericVar("CRG_RESTART_BACKOFF", ("daemon", "status"), "15"),
     NumericVar("CRG_RESTART_BACKOFF_MAX", ("daemon", "status"), "600"),
     NumericVar("CRG_RESTART_HEALTHY_AFTER", ("daemon", "status"), "300"),
@@ -1123,33 +1186,13 @@ NUMERIC_ENV_VARS: tuple[NumericVar, ...] = (
     NumericVar("CRG_VOYAGE_MIN_INTERVAL_SEC", ("status",), "0.5", False),
 )
 
-#: Numeric variables whose invalid/empty value currently escapes as a
-#: ``ValueError`` traceback instead of a message naming the variable (#912).
-#: Reproduced one subprocess at a time by the parametrized test below.
-UNGUARDED_AT_RUNTIME = frozenset(
-    {
-        "CRG_GIT_TIMEOUT",
-        "CRG_MAX_IMPACT_NODES",
-        "CRG_MAX_IMPACT_DEPTH",
-        "CRG_MAX_BFS_DEPTH",
-        "CRG_MAX_SEARCH_RESULTS",
-        "CRG_PARSE_WORKERS",
-        "CRG_MODULE_SCAN_DEPTH",
-        "CRG_MODULE_SCAN_MAX_DIRS",
-        "CRG_NESTED_IGNORE_TTL",
-        "CRG_DEPENDENT_HOPS",
-        "CRG_WATCH_PLAN_DEPTH",
-        "CRG_MAX_WATCH_SCHEDULES",
-        "CRG_WATCH_SPLIT_MIN_DIRS",
-        "CRG_WATCH_HEALTH_INTERVAL",
-        "CRG_MAX_CHANGED_FUNCS",
-        "CRG_MAX_TRANSITIVE_FRONTIER",
-        "CRG_RESTART_BACKOFF",
-        "CRG_RESTART_BACKOFF_MAX",
-        "CRG_RESTART_HEALTHY_AFTER",
-        "CRG_WATCH_HEALTH_STALE",
-    }
-)
+#: Numeric variables whose invalid/empty value escapes as a ``ValueError``
+#: traceback instead of a message naming the variable (#912). Empty since
+#: every numeric override goes through ``constants.env_int`` /
+#: ``constants.env_float``, which fall back to the documented default and
+#: warn once, by name. Kept as the hook the parametrized test below reads:
+#: a variable that regresses goes back in here with its own xfail.
+UNGUARDED_AT_RUNTIME: frozenset[str] = frozenset()
 
 REACHABLE_NUMERIC = tuple(var for var in NUMERIC_ENV_VARS if var.reachable)
 
@@ -1210,7 +1253,13 @@ def test_invalid_numeric_env_var_does_not_traceback(var, bad, built_repo, cli_en
 
 
 def _numeric_env_sites() -> list[tuple[str, str]]:
-    """``[(variable, "incremental.py:28"), ...]`` for every int()/float() of an env read."""
+    """``[(variable, "incremental.py:28"), ...]`` for every numeric env parse.
+
+    Both spellings: a bare ``int(os.environ.get(...))`` and a call to one of
+    the guarded helpers. The helper sites are reported too, so the coverage
+    table below still has to name every numeric setting in the package
+    rather than going quiet the moment a site is fixed.
+    """
     sites: list[tuple[str, str]] = []
     for path in _python_sources():
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -1222,9 +1271,15 @@ def _numeric_env_sites() -> list[tuple[str, str]]:
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
-            if not isinstance(func, ast.Name) or func.id not in ("int", "float"):
+            if not isinstance(func, ast.Name):
                 continue
-            if not node.args:
+            if func.id in _GUARDED_NUMERIC_HELPERS:
+                if node.args and isinstance(node.args[0], ast.Constant):
+                    value = node.args[0].value
+                    if isinstance(value, str) and value.isupper():
+                        sites.append((value, f"{path.name}:{node.lineno}"))
+                continue
+            if func.id not in ("int", "float") or not node.args:
                 continue
             for name in _env_names_in(node.args[0]):
                 sites.append((name, f"{path.name}:{node.lineno}"))
@@ -1254,7 +1309,12 @@ def _env_names_in(node: ast.AST) -> list[str]:
 
 
 def _guarded_sites(path: Path) -> set[int]:
-    """Line numbers inside a ``try`` whose handlers catch ValueError."""
+    """Line numbers that cannot raise on an unusable value.
+
+    Either inside a ``try`` whose handlers catch ValueError, or a call to
+    one of the helpers that already does exactly that — the point of the
+    check is "does an invalid value fall back", not "is there a try here".
+    """
     text = path.read_text(encoding="utf-8", errors="replace")
     try:
         tree = ast.parse(text)
@@ -1262,6 +1322,12 @@ def _guarded_sites(path: Path) -> set[int]:
         return set()
     guarded: set[int] = set()
     for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in _GUARDED_NUMERIC_HELPERS
+        ):
+            guarded.add(node.lineno)
         if not isinstance(node, ast.Try):
             continue
         catches_value_error = False
@@ -1280,10 +1346,14 @@ def _guarded_sites(path: Path) -> set[int]:
     return guarded
 
 
-#: Frozen baseline of unguarded ``int()``/``float()`` env parses. The point is
-#: not that 20-odd sites are acceptable — they are #912 — but that adding a
-#: *new* one fails this test today rather than in a bug report later.
-UNGUARDED_BASELINE = frozenset(UNGUARDED_AT_RUNTIME | {"CRG_TOOL_TIMEOUT", "CRG_LEIDEN_SEED"})
+#: Frozen baseline of unguarded ``int()``/``float()`` env parses. It was the
+#: 22 sites of #912; it is empty now that every one of them reads its value
+#: through ``constants.env_int`` / ``constants.env_float``. Adding a *new*
+#: bare ``int(os.environ.get(...))`` fails the test below today rather than
+#: arriving as a bug report later.
+UNGUARDED_BASELINE: frozenset[str] = frozenset(
+    UNGUARDED_AT_RUNTIME
+)
 
 
 def test_no_new_unguarded_numeric_env_parse():

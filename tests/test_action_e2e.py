@@ -36,6 +36,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import unicodedata
@@ -47,6 +48,7 @@ import pytest
 import yaml
 
 from code_review_graph.migrations import LATEST_VERSION
+from tests.test_action_render import report_rendering_to_exactly
 
 pytestmark = [
     pytest.mark.action_e2e,
@@ -90,6 +92,9 @@ STEP_BUILD = "Build or update the graph"
 STEP_ANALYZE = "Run risk-scored change analysis"
 STEP_RENDER = "Render markdown report"
 STEP_COMMENT = "Upsert sticky PR comment"
+# Unconditional, and separate from the risk gate on purpose: "no analysis
+# happened" is not a risk level, so `fail-on-risk: none` cannot switch it off.
+STEP_ANALYSIS_RAN = "Fail when the analysis did not run"
 STEP_GATE = "Enforce risk gate"
 
 # Caps the privileged workflow enforces on the artifact it downloads.
@@ -796,6 +801,7 @@ def test_canary_action_steps_are_the_real_ones():
         STEP_ANALYZE,
         STEP_RENDER,
         STEP_COMMENT,
+        STEP_ANALYSIS_RAN,
         STEP_GATE,
     ], f"action.yml step list changed: {names}"
     build = action_steps()[STEP_BUILD]["run"]
@@ -1188,11 +1194,15 @@ def test_hostile_symbol_is_neutralised(hostile_comment: str):
         max(0, raw_tag.start() - 40) : raw_tag.end() + 40
     ]
     assert "\\<img src=x onerror=alert(1)\\>" in hostile_comment, "content is kept"
-    # No markdown link survives either; the URL is left as inert text. The
-    # assertion carries the escaped brackets rather than the bare URL on
-    # purpose: a containment test against a literal that is a whole URL by
-    # itself is CodeQL's py/incomplete-url-substring-sanitization pattern,
-    # and tests/test_codeql_url_substring.py keeps it out of this repository.
+    # No markdown link survives either: the brackets are backslashed, so the
+    # payload renders as inert text with the URL still legible. Asserting the
+    # whole escaped span pins both halves of that at once, the escaping and
+    # the surviving text, and the unescaped span is asserted absent so the
+    # pair cannot both pass on a renderer that emits the link twice. Neither
+    # literal is a bare URL on its own, which is CodeQL's
+    # py/incomplete-url-substring-sanitization shape;
+    # tests/test_codeql_url_substring.py keeps that shape out of this
+    # repository.
     assert "[click](https://attacker.invalid)" not in hostile_comment
     assert "\\[click\\](https://attacker.invalid)" in hostile_comment, "kept, inert"
     links = re.findall(r"(?<!\\)\[[^\]\\]+\]\(([^)]+)\)", hostile_comment)
@@ -1502,15 +1512,6 @@ def test_missing_report_file_exits_two_without_a_traceback():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: a corrupt restored cache is not recoverable. action.yml's "
-        "'update || build' fallback fails because build also aborts with an "
-        "uncaught sqlite3.DatabaseError traceback, so every PR run stays red "
-        "until the cache is cleared by hand."
-    ),
-)
 def test_corrupt_cached_graph_falls_back_to_a_full_build(
     tmp_path_factory: pytest.TempPathFactory,
 ):
@@ -1525,6 +1526,65 @@ def test_corrupt_cached_graph_falls_back_to_a_full_build(
     build = runner.run_step(steps[STEP_BUILD], check=False)
     assert "Traceback (most recent call last)" not in build.stderr
     assert build.returncode == 0, build.stderr[-2000:]
+    # Recovered, not merely survived: the bad file is gone and a usable
+    # graph stands in its place.
+    rebuilt = cache / "graph.db"
+    assert rebuilt.read_bytes()[:16] == b"SQLite format 3\x00"
+    runner.run_step(steps[STEP_ANALYZE])
+    report = json.loads((runner.runner_temp / "crg-report.json").read_text())
+    assert report.get("changed_functions") is not None, report
+
+
+def _nodes_table_columns(db: Path) -> set[str]:
+    """Column names of the graph's ``nodes`` table, read straight from SQLite.
+
+    PRAGMA takes no placeholders, so the table name is a literal here rather
+    than interpolated.
+    """
+    conn = sqlite3.connect(db)
+    try:
+        return {row[1] for row in conn.execute("PRAGMA table_info(nodes)")}
+    finally:
+        conn.close()
+
+
+def test_cached_graph_with_foreign_tables_falls_back_to_a_full_build(
+    tmp_path_factory: pytest.TempPathFactory,
+):
+    """A valid SQLite cache whose tables are the wrong shape must recover too.
+
+    ``actions/cache`` restores whatever it last saved, and a database saved
+    by a different schema (or by something else entirely) is a perfectly
+    readable SQLite file. ``CREATE TABLE IF NOT EXISTS`` will not replace it,
+    so the build fails on the first statement that names a column it does not
+    have -- and, because ``update || build`` fails the same way twice, every
+    run stays red until someone clears the cache by hand. That is the failure
+    the corrupt-cache recovery exists to end, reached by a different route.
+    """
+    runner = make_runner(tmp_path_factory, "crg-foreign-schema", comment="false")
+    make_scratch_repo(runner.workspace)
+    cache = runner.workspace / ".code-review-graph"
+    cache.mkdir(parents=True, exist_ok=True)
+    db = cache / "graph.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE nodes (id INTEGER PRIMARY KEY, junk TEXT)")
+    conn.commit()
+    conn.close()
+    assert db.read_bytes()[:16] == b"SQLite format 3\x00", "fixture must be SQLite"
+
+    steps = action_steps()
+    runner.run_step(steps[STEP_RESOLVE_BASE])
+    build = runner.run_step(steps[STEP_BUILD], check=False)
+    assert "Traceback (most recent call last)" not in build.stderr
+    assert build.returncode == 0, build.stderr[-2000:]
+    # Recovered, not merely survived: the foreign table is gone and this
+    # project's own schema stands in its place.
+    columns = _nodes_table_columns(db)
+    assert "junk" not in columns, columns
+    assert {"qualified_name", "file_path"} <= columns, columns
+    runner.run_step(steps[STEP_ANALYZE])
+    report = json.loads((runner.runner_temp / "crg-report.json").read_text())
+    assert report.get("changed_functions") is not None, report
 
 
 @pytest.mark.xfail(
@@ -1568,16 +1628,6 @@ def test_non_finite_risk_score_is_rejected(tmp_path: Path, literal: str):
     assert "inf" not in body.lower() and "nan" not in body.lower(), body
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: the renderer's 60,000-character cap and the privileged workflow's "
-        "MAX_REPORT_BYTES=60000 are equal, but the renderer appends the "
-        "'Report truncated' notice and footer after truncating. Every truncated "
-        "report therefore exceeds the consumer's cap and the commenting "
-        "workflow aborts instead of posting."
-    ),
-)
 def test_truncated_report_is_accepted_by_the_trusted_workflow(tmp_path: Path):
     entries = [
         {
@@ -1600,7 +1650,34 @@ def test_truncated_report_is_accepted_by_the_trusted_workflow(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     body = (tmp_path / "out.md").read_text(encoding="utf-8")
     assert "*Report truncated.*" in body, "this fixture must trigger truncation"
+    # The notice and footer are inside the budget the consumer enforces, not
+    # bolted on after it.
+    assert len(body.encode("utf-8")) <= _WORKFLOW_MAX_REPORT_BYTES, len(body)
     run_trusted_validator(tmp_path, body)
+
+
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+def test_report_at_the_byte_cap_is_accepted_by_the_trusted_workflow(
+    tmp_path: Path, offset: int
+):
+    """The budget is enforced on the artifact, which is what is stat'ed.
+
+    ``_fit_to_budget`` measures the body it returns, but the render step
+    writes that body followed by a newline and the privileged workflow's
+    validator stats the file. A body sized at exactly the cap is therefore a
+    60,001-byte artifact and the workflow rejects it -- the same "largest
+    pull requests get no comment" failure the budget exists to prevent, one
+    byte later. One byte under, exactly on, and one byte over.
+    """
+    report = report_rendering_to_exactly(_WORKFLOW_MAX_REPORT_BYTES + offset)
+    result = render_report(tmp_path, report, "--max-functions", "100000")
+    assert result.returncode == 0, result.stderr
+    artifact = tmp_path / "out.md"
+    assert artifact.stat().st_size <= _WORKFLOW_MAX_REPORT_BYTES, artifact.stat().st_size
+    wrapped = run_trusted_validator(
+        tmp_path, artifact.read_text(encoding="utf-8")
+    )
+    assert HEADING in wrapped
 
 
 @pytest.mark.xfail(
@@ -1634,16 +1711,6 @@ def test_line_start_is_escaped_like_every_other_cell(tmp_path: Path):
             assert len(table_cells(row)) == width, row
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: changes._parse_unified_diff matches '^\\\\+\\\\+\\\\+ b/(.+)$', which "
-        "keeps the tab git appends when a path contains a space and never "
-        "matches git's C-quoted form for non-ASCII paths. Symbols in those "
-        "files vanish from changed_functions, review_priorities and test_gaps, "
-        "so the PR comment under-reports risk."
-    ),
-)
 @pytest.mark.parametrize("odd_name", ["my module.py", "café.py"])
 def test_paths_git_quotes_still_report_their_changed_symbols(
     tmp_path_factory: pytest.TempPathFactory, odd_name: str
@@ -1809,19 +1876,216 @@ def test_docs_security_claims_match_the_workflows():
     assert "no source code is sent to any external service" in action_prose
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: action.yml's own sticky upsert selects the first comment whose "
-        "body merely contains the marker, with no author filter. The marker is "
-        "published in docs/GITHUB_ACTION.md, so any PR participant can post a "
-        "comment containing it and the Action will target that comment instead "
-        "of its own. The privileged workflow gets this right "
-        "(.user.login == 'github-actions[bot]' plus startswith)."
-    ),
-)
 def test_sticky_upsert_only_targets_its_own_comment():
     script = action_steps()[STEP_COMMENT]["run"]
     assert "user.login" in script, (
         "the comment lookup must filter by author before PATCHing"
     )
+    # A marker anywhere in the body is not enough: the marker is published
+    # in docs/GITHUB_ACTION.md, so a participant can put it in a comment of
+    # their own and have it adopted.
+    assert "contains(" not in script, script
+    assert "startswith(" in script, script
+
+
+# ---------------------------------------------------------------------------
+# The sticky comment, against the three token kinds that can drive the Action
+# ---------------------------------------------------------------------------
+#
+# `gh api user` answers a personal access token with its own login and is
+# unavailable to an installation token. Assuming github-actions[bot] whenever
+# it fails is right for the default GITHUB_TOKEN and wrong for a GitHub App,
+# whose comments are authored by <app-slug>[bot]: the App never finds its own
+# comment and posts a new one on every push. These tests drive the Action's
+# own shell against a stub GitHub API so the behaviour is observed, not
+# inferred from the script's text.
+
+_GH_API_STUB = '''#!/usr/bin/env python3
+"""Stub of the subset of `gh api` the sticky-comment step calls."""
+import json
+import os
+import subprocess
+import sys
+
+argv = sys.argv[1:]
+log = os.environ["CRG_GH_LOG"]
+
+
+def record(entry):
+    with open(log, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry) + "\\n")
+
+
+if argv[:1] != ["api"]:
+    print("stub only implements `gh api`", file=sys.stderr)
+    sys.exit(97)
+
+method, jq_filter, endpoint = "GET", None, None
+rest = argv[1:]
+index = 0
+while index < len(rest):
+    token = rest[index]
+    if token == "--method":
+        method, index = rest[index + 1], index + 2
+    elif token == "--jq":
+        jq_filter, index = rest[index + 1], index + 2
+    elif token == "-F":
+        index += 2
+    elif token in ("--paginate", "--silent"):
+        index += 1
+    else:
+        endpoint, index = token, index + 1
+
+record([method, endpoint])
+
+if endpoint == "user":
+    whoami = os.environ.get("CRG_FAKE_WHOAMI", "")
+    if not whoami:
+        # What an installation token really gets from GET /user.
+        print("gh: Resource not accessible by integration (HTTP 403)",
+              file=sys.stderr)
+        sys.exit(1)
+    print(whoami)
+    sys.exit(0)
+
+if method != "GET":
+    sys.exit(0)
+
+payload = open(os.environ["CRG_FAKE_COMMENTS"], encoding="utf-8").read()
+if jq_filter is None:
+    sys.stdout.write(payload)
+    sys.exit(0)
+# Real `gh api --jq` runs the filter in raw-output mode.
+done = subprocess.run(
+    ["jq", "-r", jq_filter], input=payload, capture_output=True, text=True,
+)
+sys.stderr.write(done.stderr)
+sys.stdout.write(done.stdout)
+sys.exit(done.returncode)
+'''
+
+
+def _comment(comment_id: int, login: str, user_type: str, *, marked: bool) -> dict:
+    """One issue comment as the GitHub API returns it."""
+    body = (MARKER + "\n\n" + HEADING) if marked else "just a normal comment"
+    return {"id": comment_id, "user": {"login": login, "type": user_type}, "body": body}
+
+
+def _run_sticky_step(
+    tmp_path_factory: pytest.TempPathFactory,
+    slug: str,
+    *,
+    whoami: str,
+    comments: list[dict],
+) -> list[list[str]]:
+    """Run the real upsert step against a stub API; return its API calls."""
+    runner = make_runner(tmp_path_factory, slug, comment="true")
+    runner.workspace.mkdir(parents=True, exist_ok=True)
+    (runner.runner_temp / "crg-comment.md").write_text(
+        f"{MARKER}\n\n{HEADING}\n", encoding="utf-8"
+    )
+    stub = runner.shim_dir / "gh"
+    stub.write_text(_GH_API_STUB, encoding="utf-8")
+    stub.chmod(0o755)
+    payload = runner.runner_temp / "comments.json"
+    payload.write_text(json.dumps(comments), encoding="utf-8")
+    gh_log = runner.runner_temp / "gh-calls.jsonl"
+    runner.run_step(
+        action_steps()[STEP_COMMENT],
+        extra_env={
+            "CRG_GH_LOG": str(gh_log),
+            "CRG_FAKE_COMMENTS": str(payload),
+            "CRG_FAKE_WHOAMI": whoami,
+        },
+    )
+    return [
+        json.loads(line)
+        for line in gh_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+_needs_jq = pytest.mark.skipif(
+    shutil.which("jq") is None,
+    reason="the stub GitHub API runs the step's own jq filter through jq",
+)
+
+
+@_needs_jq
+def test_github_app_token_updates_its_own_sticky_comment(
+    tmp_path_factory: pytest.TempPathFactory,
+):
+    """A GitHub App's installation token must not post a duplicate.
+
+    `gh api user` is unavailable to it, and its comments are authored by
+    <app-slug>[bot], so falling back to github-actions[bot] finds nothing and
+    POSTs again on every run -- one more comment per push, forever.
+    """
+    calls = _run_sticky_step(
+        tmp_path_factory,
+        "crg-sticky-app",
+        whoami="",
+        comments=[
+            _comment(1, "someone", "User", marked=False),
+            _comment(2, "my-review-app[bot]", "Bot", marked=True),
+        ],
+    )
+    methods = [method for method, _ in calls]
+    assert "POST" not in methods, f"the App posted a duplicate: {calls}"
+    assert "PATCH" in methods, calls
+    patched = [endpoint for method, endpoint in calls if method == "PATCH"]
+    assert patched == ["repos/example/scratch/issues/comments/2"], patched
+
+
+@_needs_jq
+def test_default_github_token_still_updates_its_own_comment(
+    tmp_path_factory: pytest.TempPathFactory,
+):
+    """The documented default keeps working: no regression for GITHUB_TOKEN."""
+    calls = _run_sticky_step(
+        tmp_path_factory,
+        "crg-sticky-default",
+        whoami="",
+        comments=[_comment(7, "github-actions[bot]", "Bot", marked=True)],
+    )
+    assert [m for m, _ in calls if m == "PATCH"] == ["PATCH"], calls
+    assert "POST" not in [m for m, _ in calls], calls
+
+
+@_needs_jq
+def test_personal_access_token_matches_its_own_login_exactly(
+    tmp_path_factory: pytest.TempPathFactory,
+):
+    """A PAT knows its login, so it must adopt that comment and no other."""
+    calls = _run_sticky_step(
+        tmp_path_factory,
+        "crg-sticky-pat",
+        whoami="octo-pat",
+        comments=[
+            _comment(3, "other-app[bot]", "Bot", marked=True),
+            _comment(4, "octo-pat", "User", marked=True),
+        ],
+    )
+    patched = [endpoint for method, endpoint in calls if method == "PATCH"]
+    assert patched == ["repos/example/scratch/issues/comments/4"], patched
+
+
+@_needs_jq
+def test_a_participants_marker_comment_is_never_adopted(
+    tmp_path_factory: pytest.TempPathFactory,
+):
+    """Teeth for the fallback: widening it to bots must not widen it to people.
+
+    The marker is published in docs/GITHUB_ACTION.md, so anyone can post a
+    comment carrying it. A human participant is a User, never a Bot, and must
+    be left alone -- the Action posts its own comment instead.
+    """
+    calls = _run_sticky_step(
+        tmp_path_factory,
+        "crg-sticky-forged",
+        whoami="",
+        comments=[_comment(9, "mallory", "User", marked=True)],
+    )
+    methods = [method for method, _ in calls]
+    assert "PATCH" not in methods, f"a participant's comment was adopted: {calls}"
+    assert "POST" in methods, calls

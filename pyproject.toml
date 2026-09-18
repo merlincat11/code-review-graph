@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "code-review-graph"
-version = "2.3.8"
+version = "2.3.9"
 description = "Local-first knowledge graph for token-efficient code review through MCP and CLI"
 readme = {file = "README.md", content-type = "text/markdown"}
 license = "MIT"
@@ -30,6 +30,11 @@ dependencies = [
     # CVE-2025-62800/62801/66416 fixes; <4 prevents the next major release
     # from breaking the server the way fastmcp 3.0 did. See: #488
     "fastmcp>=3.2.4,<4",
+    # main.py imports anyio directly: the MCP tool offload has to use the
+    # same thread limiter FastMCP dispatches sync tool bodies through, not
+    # asyncio's smaller default executor. A direct import gets a direct
+    # dependency rather than relying on fastmcp to keep pulling it in.
+    "anyio>=4.0,<5",
     "tree-sitter>=0.23.0,<1",
     "tree-sitter-language-pack>=0.3.0,<1",
     "pyyaml>=6.0,<7",
@@ -165,6 +170,7 @@ markers = [
     "surface: drives every registered MCP tool and prompt through a real client over stdio",
     "corpus: builds the graph over pinned real repositories and compares recorded baselines",
     "exports: slow conformance checks for every artefact the tool writes (visualize --format html/json/graphml/cypher/obsidian/svg, and wiki)",
+    "action_e2e: drives the composite GitHub Action's own steps against scratch repositories",
     "cli_surface: enumerates the whole CLI and its failure modes as subprocesses (slow)",
     "concurrency: cross-process database contention, interrupted builds, daemon lifecycle and watcher stress (opt-in, slow)",
 ]

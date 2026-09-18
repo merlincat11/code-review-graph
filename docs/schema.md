@@ -3,7 +3,9 @@
 The graph is one SQLite database, `.code-review-graph/graph.db`, opened in WAL mode.
 The base tables and indexes come from `_SCHEMA_SQL` in `code_review_graph/graph.py`.
 Everything else is added by the versioned migrations in `code_review_graph/migrations.py`.
-The current schema version is 10.
+The current schema version is 13, the highest key in `MIGRATIONS`. A database
+below that is migrated on open, in order, by every migration above its own
+version.
 
 ## Node Types
 
@@ -92,7 +94,7 @@ was seen), `line`, `extra` (JSON), `confidence`, `confidence_tier` and, for
 | Kind | Source -> target | Notes |
 |---|---|---|
 | CALLS | caller -> called function | Target may be a bare name until a resolver qualifies it; `target_resolution` records which |
-| IMPORTS_FROM | importing file -> imported module or file | `file_path` equals the source |
+| IMPORTS_FROM | importing file -> imported module, file or package directory | `file_path` equals the source. `extra.import_scope` marks a DIRECTORY target: `package` (a Go import names a directory of files) or `tree` (a Ruby `require_all` names everything below one). The read path expands a directory to its members; see `import_scope_ancestors` in `graph.py` |
 | INHERITS | child class -> parent class | |
 | IMPLEMENTS | implementing class -> interface | |
 | CONTAINS | file -> class or function; class -> method | Structural containment |

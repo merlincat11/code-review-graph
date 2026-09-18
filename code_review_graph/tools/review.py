@@ -14,17 +14,18 @@ from ..changes import (  # noqa: F401
     parse_git_diff_ranges,
 )
 from ..context_savings import attach_context_savings, estimate_file_tokens
+from ..errors import ChangeDiscoveryError
 from ..flows import get_affected_flows as _get_affected_flows
-from ..graph import GraphNode, edge_to_dict, node_to_dict
+from ..graph import GraphNode, GraphStore, edge_to_dict, node_to_dict
 from ..hints import generate_hints, get_session
 from ..incremental import (
-    get_changed_files,
-    get_staged_and_unstaged,
+    discover_review_changes,
     resolve_review_base,
 )
 from ..parser import is_test_file, normalize_file_path
 from ._common import (
     _bounded,
+    _error_response,
     _get_store,
     _resolve_graph_file_paths,
     _shown_of,
@@ -472,16 +473,15 @@ def get_review_context(
 
     store, root = _get_store(repo_root)
     try:
-        # Resolved once, for both the file list and the hunk lookup below:
-        # an explicit ``changed_files`` list still needs a usable base,
-        # because the snippets are cut to the regions that base changed.
-        base = resolve_review_base(root, base)
-
-        # Get impact radius first
+        # The base is resolved on both branches, for the file list and for the
+        # hunk lookup below: an explicit ``changed_files`` list still needs a
+        # usable base, because the snippets are cut to the regions that base
+        # changed. Discovery resolves it as part of the chain, on the short
+        # discovery budget, so it is never resolved twice.
         if changed_files is None:
-            changed_files = get_changed_files(root, base)
-            if not changed_files:
-                changed_files = get_staged_and_unstaged(root)
+            changed_files, base = discover_review_changes(root, base)
+        else:
+            base = resolve_review_base(root, base)
 
         if not changed_files:
             return {
@@ -691,7 +691,7 @@ def get_review_context(
                 context["truncated"] = True
 
         # Generate review guidance
-        guidance = _generate_review_guidance(impact, changed_files, root)
+        guidance = _generate_review_guidance(impact, changed_files, root, store)
         context["review_guidance"] = guidance
 
         summary_parts = [
@@ -714,12 +714,21 @@ def get_review_context(
         }
         attach_context_savings(result, original_tokens=original_tokens)
         return result
+    except ChangeDiscoveryError as exc:
+        # Distinct from the "no changed files" answer above, and deliberately
+        # so: that one is an all-clear a client will act on. Git that could
+        # not be run, or that overran the discovery budget, says nothing
+        # about the working tree (#262).
+        return _error_response(str(exc))
     finally:
         store.close()
 
 
 def _generate_review_guidance(
-    impact: dict, changed_files: list[str], repo_root: "str | Path | None" = None,
+    impact: dict,
+    changed_files: list[str],
+    repo_root: "str | Path | None" = None,
+    store: "GraphStore | None" = None,
 ) -> str:
     """Generate review guidance based on the impact analysis.
 
@@ -727,6 +736,12 @@ def _generate_review_guidance(
     than an absolute one. Without it, directory conventions are skipped for
     absolute paths, which can leave a test helper in the untested list but
     never hides a production gap. See #1023.
+
+    *store* lets this split the untested list the same way ``detect_changes``
+    does. CLAUDE.md sends reviewers through both tools in one session, so when
+    one says a symbol "lacks test coverage" and the other says a tested caller
+    reaches it, the reviewer gets two answers and no way to pick. Without a
+    store the wording still stays inside what an edge check can support.
     """
     guidance_parts = []
 
@@ -744,10 +759,34 @@ def _generate_review_guidance(
         and not is_test_file(f.file_path, repo_root)
     ]
     if untested:
+        routes: dict = {}
+        if store is not None:
+            try:
+                routes = store.get_caller_test_routes(
+                    (f.qualified_name for f in untested),
+                    repo_root=str(repo_root) if repo_root else None,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("caller-route lookup failed: %s", exc)
+                routes = {}
+        unreached = [f for f in untested if f.qualified_name not in routes]
+        indirect = [f for f in untested if f.qualified_name in routes]
+        # "no direct test", never "untested": a test reaching this code through
+        # importlib, a fixture or a subprocess leaves no edge behind.
         guidance_parts.append(
-            f"- {len(untested)} changed function(s) lack test coverage: "
+            f"- {len(untested)} changed function(s) have no direct test: "
             + ", ".join(n.name for n in untested[:5])
         )
+        if indirect:
+            guidance_parts.append(
+                f"  - of those, {len(indirect)} are reached only through a "
+                "caller (a call path, not a record of execution): "
+                + ", ".join(n.name for n in indirect[:5])
+            )
+            guidance_parts.append(
+                f"  - {len(unreached)} have no tested caller found: "
+                + ", ".join(n.name for n in unreached[:5])
+            )
 
     # Check for wide blast radius
     if len(impact["impacted_nodes"]) > 20:
@@ -830,10 +869,7 @@ def get_affected_flows_func(
     store, root = _get_store(repo_root)
     try:
         if changed_files is None:
-            base = resolve_review_base(root, base)
-            changed_files = get_changed_files(root, base)
-            if not changed_files:
-                changed_files = get_staged_and_unstaged(root)
+            changed_files, base = discover_review_changes(root, base)
 
         if not changed_files:
             return {
@@ -937,12 +973,17 @@ def detect_changes_func(
 
     store, root = _get_store(repo_root)
     try:
-        base = resolve_review_base(root, base)
         # Detect changed files if not provided.
         if changed_files is None:
-            changed_files = get_changed_files(root, base)
-            if not changed_files:
-                changed_files = get_staged_and_unstaged(root)
+            # discover_review_changes carries require_vcs through the whole
+            # chain: the "no changed files" answer below is an all-clear, and
+            # a git that could not be run (or overran the discovery budget)
+            # must not produce it. The ChangeDiscoveryError becomes
+            # {"status": "error"} instead, so a client can tell "nothing to
+            # review" from "could not look".
+            changed_files, base = discover_review_changes(root, base)
+        else:
+            base = resolve_review_base(root, base)
 
         if not changed_files:
             return {
@@ -962,6 +1003,9 @@ def detect_changes_func(
         abs_files = [normalize_file_path(root / f) for f in changed_files]
 
         # Parse diff ranges for line-level mapping.
+        # Lenient on purpose: the changed-file list above is already known
+        # to be non-empty, so an unreadable line-level diff costs precision,
+        # not honesty. analyze_changes records the degradation.
         diff_ranges = parse_diff_ranges(str(root), base)
         # Remap to absolute paths so they match graph file_paths.
         abs_ranges: dict[str, list[tuple[int, int]]] = {}

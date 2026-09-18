@@ -179,7 +179,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: tirth8205/code-review-graph@v2.3.8
+      - uses: tirth8205/code-review-graph@v2.3.9
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
@@ -518,7 +518,8 @@ pip install "code-review-graph[all]"                 # All optional dependencies
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `CRG_GIT_TIMEOUT` | Timeout in seconds for Git operations | `30` |
+| `CRG_GIT_TIMEOUT` | Timeout in seconds for Git operations (build, update, watch) | `30` |
+| `CRG_DISCOVERY_TIMEOUT` | Timeout in seconds for each Git command that discovers what changed, when a review tool or command was not given an explicit file list. Running out reports an error, never "no changes" | `5`, or `CRG_GIT_TIMEOUT` when you set that explicitly |
 | `CRG_DATA_DIR` | Directory for graph databases and generated artefacts | - |
 | `CRG_HOOK_WORKTREES` | Set to `1` to let the pre-commit hook run in linked git worktrees | - |
 | `CRG_EMBEDDING_MODEL` | Default model for local vector embeddings | `all-MiniLM-L6-v2` |
@@ -529,7 +530,9 @@ pip install "code-review-graph[all]"                 # All optional dependencies
 | `CRG_MAX_BFS_DEPTH` | Maximum depth for graph traversal | `15` |
 | `CRG_MAX_CHANGED_FUNCS` | Maximum changed functions analysed in one change report | `500` |
 | `CRG_MAX_TRANSITIVE_FRONTIER` | Maximum frontier size for transitive caller/callee expansion | `50` |
-| `CRG_TOOL_TIMEOUT` | Timeout in seconds for bounded MCP tools (`0` disables) | `0` |
+| `CRG_CALLER_TEST_ROUTE_DEPTH` | Hops to walk up incoming `CALLS` when looking for a tested caller of an untested changed symbol. Reported as a note, never as coverage | `2` |
+| `CRG_CALLER_TEST_ROUTE_MAX_CALLERS` | Maximum callers examined while looking for that tested caller | `500` |
+| `CRG_TOOL_TIMEOUT` | Timeout in seconds for read-only MCP tools (`0` disables). Does not bound the tools that write: build, postprocess, embed, wiki and apply-refactor | `0` |
 | `CRG_CHURN_WINDOW_DAYS` | Window for `detect-changes --churn` commit counts | `90` |
 | `CRG_LEIDEN_SEED` | Seed for Leiden community detection | `42` |
 | `CRG_RECURSE_SUBMODULES` | Include git submodules when set to `1`, `true` or `yes` | - |
@@ -661,7 +664,9 @@ pytest
 ```
 
 Pull requests target `staging` (the default branch). Changes are promoted
-`staging` → `testing` → `main`, and releases are tagged from `main`. See
+`staging` → `testing` → `main`, and releases are tagged from `main`. The first
+step runs once a day by itself when `staging` is green; promotion to `main` is
+never automatic. See
 [CONTRIBUTING.md](CONTRIBUTING.md#branching-and-promotion) for the full flow.
 
 To add a built-in language, edit `code_review_graph/parser.py`: add the extension to `EXTENSION_TO_LANGUAGE` and node type mappings to `_CLASS_TYPES`, `_FUNCTION_TYPES`, `_IMPORT_TYPES` and `_CALL_TYPES`. Include a test fixture and open a PR. For a language you only need in one repository, use [`languages.toml`](docs/CUSTOM_LANGUAGES.md) instead.

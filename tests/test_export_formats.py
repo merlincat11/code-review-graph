@@ -132,6 +132,13 @@ HOSTILE_NAMES: dict[str, str] = {
     # value normalisation collapses one onto the other.
     "newline_twin": "collide\nme",
     "space_twin": "collide me",
+    # U+007F (DEL) is an ordinary character in XML 1.0 -- the Char production
+    # admits all of [#x20-#xD7FF] -- and _sanitize_name keeps it, so it is
+    # part of a node's identity. These two differ only by it: an exporter
+    # that strips it turns them into one node, which is the newline collision
+    # above in a smaller form.
+    "del_twin": "del\x7ftwin",
+    "del_shadow": "deltwin",
 }
 
 # A file path containing ": ", which is legal on POSIX and breaks unquoted
@@ -470,12 +477,31 @@ def _graphml_text(corpus: Corpus) -> str:
 def _with_official_namespace(text: str) -> str:
     """Rewrite the declared namespace to the official one.
 
-    Used so the checks below can look past the namespace bug at whatever
-    else is wrong with the document.
+    A no-op on a correct document, and the guard that keeps it correct: a
+    regression to a private namespace would be caught by
+    test_graphml_declares_the_official_graphml_namespace rather than
+    silently repaired here.
     """
     root = ET.fromstring(text)
     declared = root.tag.split("}")[0].lstrip("{")
     return text.replace(declared, GRAPHML_NS)
+
+
+def _graphml_node_data(node: ET.Element) -> dict[str, str]:
+    """Read one <node>'s <data> children into a plain dict."""
+    return {
+        d.get("key") or "": (d.text or "")
+        for d in node.findall(f"{{{GRAPHML_NS}}}data")
+    }
+
+
+def _graphml_qualified_names(text: str) -> list[str]:
+    """Every node's qualified name, as the XML parser reads it back."""
+    root = ET.fromstring(text)
+    return [
+        _graphml_node_data(n).get("qualified_name", "")
+        for n in root.iter(f"{{{GRAPHML_NS}}}node")
+    ]
 
 
 def test_graphml_is_well_formed_xml_covering_the_whole_graph(corpus: Corpus):
@@ -496,23 +522,11 @@ def test_graphml_is_well_formed_xml_covering_the_whole_graph(corpus: Corpus):
     _record("graphml", "elements", len(nodes) + len(edges))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: exports.py declares xmlns=http://graphml.graphstruct.org/"
-           "graphml; the GraphML namespace is http://graphml.graphdrawing."
-           "org/xmlns",
-)
 def test_graphml_declares_the_official_graphml_namespace(corpus: Corpus):
     root = ET.fromstring(_graphml_text(corpus))
     assert root.tag == f"{{{GRAPHML_NS}}}graphml"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: wrong xmlns, so no GraphML reader accepts the file -- "
-           "networkx is already a hard dependency of this project and "
-           "rejects it",
-)
 def test_graphml_is_readable_by_networkx(corpus: Corpus):
     import networkx as nx
 
@@ -520,14 +534,10 @@ def test_graphml_is_readable_by_networkx(corpus: Corpus):
     assert graph.number_of_nodes() == len(corpus.payload["nodes"])
 
 
-def test_graphml_would_load_in_networkx_once_the_namespace_is_right(
+def test_graphml_body_carries_its_data_keys_into_networkx(
     corpus: Corpus, tmp_path
 ):
-    """Isolates the namespace bug: everything else about the document loads.
-
-    This is the teeth for the xfail above. If the only problem were the
-    namespace, this passes; if the body were also malformed, it fails.
-    """
+    """Not just parseable: the payload survives a real GraphML reader."""
     import networkx as nx
 
     fixed = tmp_path / "ns-fixed.graphml"
@@ -535,20 +545,15 @@ def test_graphml_would_load_in_networkx_once_the_namespace_is_right(
         _with_official_namespace(_graphml_text(corpus)), encoding="utf-8"
     )
     graph = nx.read_graphml(str(fixed))
-    # Newline-bearing ids collapse on to their space twins (see below), so
-    # the node count is a lower bound, not an equality.
-    assert graph.number_of_nodes() >= len(corpus.payload["nodes"]) - 1
+    assert graph.number_of_nodes() == len(corpus.payload["nodes"])
     assert graph.number_of_edges() > 0
     kinds = {d.get("kind") for _, d in graph.nodes(data=True)}
     assert "Function" in kinds and "File" in kinds
+    qns = {d.get("qualified_name") for _, d in graph.nodes(data=True)}
+    assert corpus.qn("newline_twin") in qns
     _record("graphml", "networkx_nodes", graph.number_of_nodes())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: xsi:schemaLocation carries one URI; the attribute is a "
-           "whitespace-separated (namespace, schema-location) pair list",
-)
 def test_graphml_schema_location_is_a_namespace_location_pair(corpus: Corpus):
     text = _graphml_text(corpus)
     match = re.search(r'xsi:schemaLocation="([^"]*)"', text)
@@ -558,12 +563,6 @@ def test_graphml_schema_location_is_a_namespace_location_pair(corpus: Corpus):
     assert tokens[0] == GRAPHML_NS
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: GraphML types node/@id as NMTOKEN (pattern \\c+), and every "
-           "qualified name contains '/' and '::', so no exported document "
-           "validates -- even one with no hostile content",
-)
 def test_graphml_validates_against_the_official_xsd(corpus: Corpus):
     xmlschema = _require_xmlschema()
     schema = xmlschema.XMLSchema(str(XSD_DIR / "graphml.xsd"))
@@ -606,56 +605,103 @@ def test_graphml_ids_are_unique_and_edges_reference_declared_nodes(
     _record("graphml", "edges_resolved", len(ids))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: a newline in a name is written raw into node/@id, and XML "
-           "attribute-value normalisation turns it into a space, so "
-           "'collide\\nme' and 'collide me' silently become one node",
-)
 def test_graphml_keeps_newline_bearing_names_distinct(corpus: Corpus):
-    root = ET.fromstring(_with_official_namespace(_graphml_text(corpus)))
+    """A newline in a name must not merge two nodes into one.
+
+    GraphML ids are NMTOKENs, so the qualified name cannot be the id; it
+    travels in a <data> element, whose content - unlike an attribute value -
+    is not whitespace-normalised, and the newline survives.
+    """
+    root = ET.fromstring(_graphml_text(corpus))
     graph = root.find(f"{{{GRAPHML_NS}}}graph")
-    ids = [n.get("id") for n in graph.findall(f"{{{GRAPHML_NS}}}node")]
+    nodes = graph.findall(f"{{{GRAPHML_NS}}}node")
+    ids = [n.get("id") for n in nodes]
     assert len(ids) == len(set(ids)), "duplicate node ids after XML parsing"
-    assert corpus.qn("newline_twin") in set(ids)
+    qns = [_graphml_node_data(n).get("qualified_name") for n in nodes]
+    assert len(qns) == len(set(qns)), "two names collapsed onto one node"
+    assert corpus.qn("newline_twin") in set(qns)
+    assert corpus.qn("space_twin") in set(qns)
 
 
-def test_graphml_newline_collision_is_real_not_theoretical(corpus: Corpus):
-    """Teeth for the xfail above: show the two names really merge."""
-    root = ET.fromstring(_with_official_namespace(_graphml_text(corpus)))
-    graph = root.find(f"{{{GRAPHML_NS}}}graph")
-    ids = [n.get("id") for n in graph.findall(f"{{{GRAPHML_NS}}}node")]
-    twin = corpus.qn("space_twin")
-    assert ids.count(twin) == 2, (
-        "expected the newline name and the space name to normalise onto the "
-        f"same id; got {ids.count(twin)} occurrences of {twin!r}"
+def test_graphml_newline_and_space_twins_stay_two_nodes(corpus: Corpus):
+    """Teeth for the check above: the collision it guards is reachable.
+
+    'collide\\nme' and 'collide me' differ only by newline-versus-space, so
+    they are exactly the pair XML attribute-value normalisation would fold
+    together. Both must appear, once each, and carry the raw newline.
+    """
+    text = _graphml_text(corpus)
+    qns = _graphml_qualified_names(text)
+    newline_twin = corpus.qn("newline_twin")
+    space_twin = corpus.qn("space_twin")
+    assert "\n" in newline_twin, "the fixture no longer plants a newline"
+    assert newline_twin.replace("\n", " ") == space_twin, "twins drifted apart"
+    assert qns.count(newline_twin) == 1, qns.count(newline_twin)
+    assert qns.count(space_twin) == 1, qns.count(space_twin)
+    # The newline reaches the file as element content, never as an attribute
+    # value, which is what makes it survive the round trip.
+    assert f'id="{newline_twin}"' not in text
+    _record("graphml", "twins_kept_apart", 2)
+
+
+def test_graphml_keeps_del_bearing_names_distinct(corpus: Corpus):
+    """U+007F is a legal XML 1.0 character and part of a node's identity.
+
+    XML 1.0's Char production admits the whole of [#x20-#xD7FF], so DEL
+    needs no escaping and no removal, and ``_sanitize_name`` leaves it in a
+    node name. Dropping it on the way out rewrites the identity the export
+    carries: 'del\\x7ftwin' and 'deltwin' come back as one name.
+    """
+    text = _graphml_text(corpus)
+    qns = _graphml_qualified_names(text)
+    twin = corpus.qn("del_twin")
+    shadow = corpus.qn("del_shadow")
+    assert "\x7f" in twin, "the fixture no longer plants a DEL"
+    assert twin.replace("\x7f", "") == shadow, "twins drifted apart"
+    assert qns.count(twin) == 1, f"DEL was stripped from the identity: {twin!r}"
+    assert qns.count(shadow) == 1, qns.count(shadow)
+    assert len(qns) == len(set(qns)), "two names collapsed onto one node"
+    _record("graphml", "del_twins_kept_apart", 2)
+
+
+def test_graphml_del_survives_a_real_graphml_reader(corpus: Corpus, tmp_path):
+    """Teeth for the check above: a reader, not just the raw text.
+
+    Writing the DEL out is only half of it -- an XML parser has to hand it
+    back. It does: unlike a carriage return, DEL is not touched by
+    line-end normalisation, and unlike a newline in an attribute value it is
+    not whitespace-normalised in element content.
+    """
+    import networkx as nx
+
+    fixed = tmp_path / "ns-fixed-del.graphml"
+    fixed.write_text(
+        _with_official_namespace(_graphml_text(corpus)), encoding="utf-8"
     )
-    assert len(set(ids)) < len(ids)
-    _record("graphml", "id_collisions_found", ids.count(twin))
+    graph = nx.read_graphml(str(fixed))
+    qns = {d.get("qualified_name") for _, d in graph.nodes(data=True)}
+    assert corpus.qn("del_twin") in qns
+    assert corpus.qn("del_shadow") in qns
+    _record("graphml", "del_round_tripped", 2)
 
 
 def test_graphml_escapes_hostile_names(corpus: Corpus):
     text = _graphml_text(corpus)
-    root = ET.fromstring(_with_official_namespace(text))
+    root = ET.fromstring(text)
     # The XML parser is the consumer: names are read back out of the parsed
-    # tree, so escaping that merely hid a name would fail here.
-    parsed_ids = {n.get("id") for n in root.iter(f"{{{GRAPHML_NS}}}node")}
+    # tree, so escaping that merely hid a name would fail here. No
+    # transformation is allowed -- the identity round-trips byte for byte.
+    parsed_qns = set(_graphml_qualified_names(text))
     parsed_names = {
-        qn.split("::", 1)[-1] for qn in parsed_ids if "::" in qn
-    } | set(parsed_ids)
-    # XML attribute-value normalisation turns a raw newline into a space, so
-    # that is the one transformation the names legitimately undergo here; it
-    # is pinned by test_graphml_newline_collision_is_real_not_theoretical.
-    _require_planted(
-        parsed_names, "graphml", normalise=lambda s: s.replace("\n", " ")
-    )
+        qn.split("::", 1)[-1] for qn in parsed_qns if "::" in qn
+    } | parsed_qns
+    _require_planted(parsed_names, "graphml")
     tags = {el.tag.split("}")[-1] for el in root.iter()}
     assert tags <= {"graphml", "key", "graph", "node", "edge", "data"}, tags
     assert "evil" not in tags and "img" not in tags and "script" not in tags
     # The markup characters survive as text, not as markup.
-    ids = {n.get("id") for n in root.iter(f"{{{GRAPHML_NS}}}node")}
-    assert corpus.qn("script_close") in ids
-    assert corpus.qn("xml_attr") in ids
+    assert corpus.qn("script_close") in parsed_qns
+    assert corpus.qn("xml_attr") in parsed_qns
     assert "\x00" not in text and "\x1b" not in text
     _record("graphml", "hostile_ids_checked", len(HOSTILE_NAMES))
 
@@ -953,27 +999,26 @@ def test_cypher_relationships_reference_created_nodes(corpus: Corpus):
     _record("cypher", "relationships_resolved", len(rels))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG (known): in exports._cypher_props the `isinstance(v, (int, "
-           "float))` branch precedes `isinstance(v, bool)`, and bool is a "
-           "subclass of int, so the bool branch is dead and booleans are "
-           "emitted as Python True/False rather than Cypher true/false",
-)
 def test_cypher_props_emits_cypher_boolean_literals():
     out = _cypher_props({"is_test": True, "is_stub": False})
     assert out == "{is_test: true, is_stub: false}", out
 
 
-def test_cypher_boolean_bug_is_exactly_the_dead_branch():
-    """Teeth for the xfail above: pin the current wrong output precisely."""
-    assert _cypher_props({"flag": True}) == "{flag: True}"
-    assert _cypher_props({"flag": False}) == "{flag: False}"
-    # It still imports: Cypher boolean literals are case-insensitive, so the
-    # damage today is non-canonical output and an unreachable branch.
-    props = _parse_cypher("CREATE (:X " + _cypher_props({"flag": True}) + ");")
-    assert props[0][0].props == {"flag": True}
-    _record("cypher", "boolean_branch_pinned", 2)
+def test_cypher_boolean_branch_is_reachable_and_wins_over_int():
+    """Teeth for the check above: bool must be tested before int.
+
+    ``bool`` is a subclass of ``int``, so an ``isinstance(v, (int, float))``
+    branch placed first makes the boolean branch dead code and emits
+    Python's ``True``/``False``. Real integers must keep their own form.
+    """
+    assert _cypher_props({"flag": True}) == "{flag: true}"
+    assert _cypher_props({"flag": False}) == "{flag: false}"
+    assert _cypher_props({"n": 1, "zero": 0}) == "{n: 1, zero: 0}"
+    nodes, _ = _parse_cypher(
+        "CREATE (:X " + _cypher_props({"flag": True, "n": 3}) + ");"
+    )
+    assert nodes[0].props == {"flag": True, "n": 3}
+    _record("cypher", "boolean_branch_pinned", 3)
 
 
 @pytest.mark.xfail(
@@ -1090,12 +1135,6 @@ def _frontmatter(text: str) -> str | None:
     return None if end == -1 else text[4:end]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: exports.export_obsidian_vault writes frontmatter values as "
-           "bare YAML scalars, so a file path containing ': ' (legal on "
-           "POSIX) makes the page's frontmatter unparseable",
-)
 def test_obsidian_frontmatter_is_valid_yaml(corpus: Corpus):
     bad: list[tuple[str, str]] = []
     checked = 0
@@ -1115,21 +1154,20 @@ def test_obsidian_frontmatter_is_valid_yaml(corpus: Corpus):
     assert not bad, bad
 
 
-def test_obsidian_frontmatter_failure_is_the_colon_path(corpus: Corpus):
-    """Teeth for the xfail above: name the one page that fails and why."""
-    failures = []
-    for page in _vault(corpus).glob("*.md"):
-        if page.name.startswith("_"):
-            continue
-        block = _frontmatter(page.read_text(encoding="utf-8"))
-        try:
-            yaml.safe_load(block or "")
-        except yaml.YAMLError:
-            failures.append(page.name)
-    assert failures == ["colon-path-function.md"], failures
-    text = (_vault(corpus) / failures[0]).read_text(encoding="utf-8")
-    assert f"file: {COLON_FILE_PATH}" in text
-    _record("obsidian", "yaml_failures_identified", len(failures))
+def test_obsidian_colon_path_round_trips_through_yaml(corpus: Corpus):
+    """Teeth for the check above: name the page that used to fail, and why.
+
+    ``odd: dir/module.py`` is a legal POSIX path and a bare YAML scalar
+    cannot carry the ``": "``. The value must come back out of a real YAML
+    parser byte for byte, not merely parse into something.
+    """
+    page = _vault(corpus) / "colon-path-function.md"
+    assert page.is_file(), sorted(p.name for p in _vault(corpus).glob("*.md"))
+    text = page.read_text(encoding="utf-8")
+    assert f"file: {COLON_FILE_PATH}" not in text, "still a bare scalar"
+    parsed = yaml.safe_load(_frontmatter(text) or "")
+    assert parsed["file"] == COLON_FILE_PATH, parsed
+    _record("obsidian", "colon_path_round_tripped", 1)
 
 
 def test_obsidian_hostile_names_stay_inert(corpus: Corpus):
@@ -1241,12 +1279,6 @@ def test_svg_truncates_a_label_at_its_first_newline(svg_pair, corpus: Corpus):
     _record("svg", "label_truncation_pinned", 2)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: exports.export_svg leaves matplotlib mathtext enabled, so a "
-           "node name with two '$' (legal in JS, PHP, Perl, shell and in "
-           "file paths) aborts the whole export with ValueError",
-)
 def test_svg_survives_a_name_that_looks_like_mathtext(corpus: Corpus, tmp_path):
     _require_matplotlib()
     from code_review_graph.exports import export_svg
@@ -1263,10 +1295,14 @@ def test_svg_survives_a_name_that_looks_like_mathtext(corpus: Corpus, tmp_path):
     export_svg(store, tmp_path / "math.svg")
 
 
-def test_svg_mathtext_failure_is_a_hard_crash_not_a_degraded_label(
+def test_svg_draws_a_mathtext_shaped_name_literally(
     corpus: Corpus, tmp_path
 ):
-    """Teeth for the xfail above: the whole export dies, nothing is written."""
+    """Teeth for the check above: the label is drawn, not silently dropped.
+
+    Surviving the export is not enough -- a name matplotlib refused to
+    typeset must still reach the picture as ordinary text.
+    """
     _require_matplotlib()
     from code_review_graph.exports import export_svg
 
@@ -1278,9 +1314,11 @@ def test_svg_mathtext_failure_is_a_hard_crash_not_a_degraded_label(
     ))
     store.commit()
     out = tmp_path / "math2.svg"
-    with pytest.raises(ValueError, match=r"Unknown symbol"):
-        export_svg(store, out)
-    _record("svg", "mathtext_crash_confirmed", 1)
+    export_svg(store, out)
+    text = out.read_text(encoding="utf-8")
+    assert r"<!-- $\qqq$ -->" in text, "the label never reached the picture"
+    ET.fromstring(text)
+    _record("svg", "mathtext_label_drawn", 1)
 
 
 def _normalise_svg(text: str, *, clip_ids: bool) -> str:
@@ -1540,12 +1578,6 @@ def _member_table_lines(corpus: Corpus) -> list[tuple[str, str]]:
     return out
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: wiki._generate_community_page writes node names straight "
-           "into a Markdown table without escaping '|' or newline, so a "
-           "name carrying either corrupts the Members table",
-)
 def test_wiki_member_tables_are_well_formed(corpus: Corpus):
     lines = _member_table_lines(corpus)
     assert lines, "no Members table to check"
@@ -1556,31 +1588,32 @@ def test_wiki_member_tables_are_well_formed(corpus: Corpus):
     assert not malformed, malformed
 
 
-def test_wiki_table_corruption_is_the_pipe_and_the_newline(corpus: Corpus):
-    """Teeth for the xfail above: name the rows that corrupt the table."""
+def test_wiki_pipe_and_newline_names_are_on_the_page_and_in_one_row(
+    corpus: Corpus,
+):
+    """Teeth for the check above: the names that corrupted the table are
+    still documented, each in exactly one four-cell row.
+
+    A table can also be made well-formed by dropping the awkward rows, which
+    would be a worse bug than the one being fixed, so the rows are located
+    by content here rather than merely counted.
+    """
     lines = _member_table_lines(corpus)
     assert lines, "no Members table to check"
-    over = [ln for _, ln in lines if len(_cells(ln) or []) > 4]
-    not_a_row = [ln for _, ln in lines if _cells(ln) is None]
-    # An unescaped '|' adds cells to its row ...
-    assert any("pipe" in ln for ln in over), (
-        f"expected the '|' name to add cells; over-wide rows: {over}"
-    )
-    # ... and an unescaped newline splits one row into two broken halves.
-    assert any("backslash" in ln for ln in not_a_row), not_a_row
-    assert any("and a newline" in ln for ln in not_a_row), not_a_row
-    _record("wiki", "corrupt_rows_identified", len(over) + len(not_a_row))
+    pipe_rows = [ln for _, ln in lines if "pipe" in ln]
+    newline_rows = [ln for _, ln in lines if "and a newline" in ln]
+    assert len(pipe_rows) == 1, pipe_rows
+    assert len(newline_rows) == 1, newline_rows
+    for row in pipe_rows + newline_rows:
+        cells = _cells(row)
+        assert cells is not None and len(cells) == 4, row
+    # The pipe is still readable -- escaped, not deleted -- and the newline
+    # no longer ends the row early.
+    assert "pipe&#124;cell&#124;break" in pipe_rows[0], pipe_rows[0]
+    assert "backslash and a newline" in newline_rows[0], newline_rows[0]
+    _record("wiki", "awkward_rows_kept_intact", 2)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: communities.get_communities returns member qualified names "
-           "run through _sanitize_name, but nodes are stored under their raw "
-           "qualified name, so wiki._generate_community_page's "
-           "store.get_node() misses every node whose name contains a control "
-           "character and silently drops it from the Members table while the "
-           "page still reports the larger Size",
-)
 def test_wiki_lists_every_member_of_every_community(corpus: Corpus):
     from code_review_graph.communities import get_communities
 
@@ -1604,8 +1637,14 @@ def test_wiki_lists_every_member_of_every_community(corpus: Corpus):
     assert checked
 
 
-def test_wiki_drops_exactly_the_control_character_node(corpus: Corpus):
-    """Teeth for the xfail above: show which node vanishes, and why."""
+def test_wiki_documents_the_control_character_node(corpus: Corpus):
+    """Teeth for the check above: the node that used to vanish is on a page.
+
+    get_communities() runs every member qualified name through
+    _sanitize_name before returning it, so the sanitised spelling is not a
+    key store.get_node() understands. The node is still a member; the page
+    has to find it anyway.
+    """
     from code_review_graph.communities import get_communities
 
     sanitised_qn = corpus.qn("control_chars")
@@ -1615,28 +1654,26 @@ def test_wiki_drops_exactly_the_control_character_node(corpus: Corpus):
         qn for c in get_communities(corpus.store) for qn in c["members"]
     }
     assert sanitised_qn in members
-    # ... the store cannot find it under that spelling ...
+    # ... the store still cannot find it under that spelling ...
     assert corpus.store.get_node(sanitised_qn) is None
     # ... but the raw spelling, control characters and all, is there ...
     raw_qn = sanitised_qn.replace(
         "ctrlname", HOSTILE_NAMES["control_chars"]
     )
     assert corpus.store.get_node(raw_qn) is not None
-    # ... so the wiki never mentions it at all.
+    # ... and the wiki documents it, under its sanitised name.
+    rows = [line for _, line in _member_table_lines(corpus)
+            if "ctrlname" in line]
+    assert len(rows) == 1, rows
+    assert _cells(rows[0]) is not None and len(_cells(rows[0])) == 4
     joined = "\n".join(
         page.read_text(encoding="utf-8")
         for page in _wiki(corpus).glob("*.md")
     )
-    assert "ctrlname" not in joined
-    _record("wiki", "dropped_member_identified", 1)
+    assert "\x00" not in joined and "\x1b" not in joined
+    _record("wiki", "control_character_member_documented", 1)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: a community name is written unescaped into the page's H1 "
-           "and into the index table, and community names are built from "
-           "node names, so a '|' or newline in a name corrupts both",
-)
 def test_wiki_community_name_is_escaped_in_the_page_heading(corpus: Corpus):
     page = _generate_community_page(
         corpus.store,
@@ -1648,15 +1685,24 @@ def test_wiki_community_name_is_escaped_in_the_page_heading(corpus: Corpus):
             "members": [],
         },
     )
-    heading = page.splitlines()[0]
-    assert heading.startswith("# ")
-    assert "\n" not in page.split("\n## Overview")[0].removeprefix("# ")
-    index_row = f"| {page.splitlines()[0][2:]} | 1 | [x.md](x.md) |"
+    # Nothing may spill out of the heading into the page body: everything
+    # before "## Overview" is the H1 and blank lines, nothing else. (The
+    # blank line the generator writes after the heading is why this looks at
+    # the prologue's lines rather than at the raw text.)
+    prologue = page.split("\n## Overview")[0].splitlines()
+    assert prologue[0].startswith("# ")
+    assert [line for line in prologue[1:] if line.strip()] == [], prologue
+    # The same name is written into the index table, one cell wide.
+    index_row = f"| {prologue[0][2:]} | 1 | [x.md](x.md) |"
     assert len(index_row.strip().strip("|").split("|")) == 3, index_row
 
 
-def test_wiki_community_name_leak_is_real(corpus: Corpus):
-    """Teeth for the xfail above: the raw name reaches the page verbatim."""
+def test_wiki_community_name_survives_escaping_readably(corpus: Corpus):
+    """Teeth for the check above: escaped, not truncated at the first '|'.
+
+    A heading that simply dropped everything after the pipe would also pass
+    the structural check, so pin what the reader actually sees.
+    """
     page = _generate_community_page(
         corpus.store,
         {
@@ -1667,21 +1713,25 @@ def test_wiki_community_name_leak_is_real(corpus: Corpus):
             "members": [],
         },
     )
-    assert page.startswith("# billing|core\nsplit\n")
-    _record("wiki", "community_name_leak_confirmed", 1)
+    assert page.startswith("# billing&#124;core split\n"), page.splitlines()[0]
+    _record("wiki", "community_name_escaped", 1)
 
 
 def test_wiki_hostile_member_names_are_sanitised(corpus: Corpus):
+    from code_review_graph.wiki import _md_cell
+
     pages = sorted(_wiki(corpus).glob("*.md"))
     joined = "\n".join(p.read_text(encoding="utf-8") for p in pages)
-    # control_chars is dropped outright -- see the xfail above -- so require
-    # every other planted name and name the exception explicitly.
-    expected = {k for k in HOSTILE_NAMES if k != "control_chars"}
+    # A Markdown table cell cannot carry a raw '|' or a newline, so those
+    # two are escaped on the way in; that is the one transformation allowed
+    # here, and it is pinned by
+    # test_wiki_pipe_and_newline_names_are_on_the_page_and_in_one_row.
     present = {
-        key for key in expected
-        if _sanitize_name(HOSTILE_NAMES[key]) in joined
+        key for key, raw in HOSTILE_NAMES.items()
+        if _md_cell(_sanitize_name(raw)) in joined
     }
-    assert present == expected, f"missing from the wiki: {expected - present}"
+    missing = set(HOSTILE_NAMES) - present
+    assert not missing, f"missing from the wiki: {missing}"
     assert "\x00" not in joined and "\x1b" not in joined
     _record("wiki", "hostile_names_present", len(present))
     _record("wiki", "pages_scanned", len(pages))
